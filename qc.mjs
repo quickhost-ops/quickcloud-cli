@@ -70,7 +70,13 @@ async function api(method, p, body) {
   } catch (e) { fail(`could not reach ${url} (${e?.message || e})`); }
   const text = await res.text();
   let json = null; try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
-  if (!res.ok) fail((json && json.error && (json.error.message || json.error)) || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const e = json && json.error;
+    let msg = (e && (e.message || e)) || `HTTP ${res.status}`;
+    if (e && Array.isArray(e.fields) && e.fields.length) msg += ` — ${e.fields.map((f) => `${f.field} ${f.error}`).join(', ')}`;
+    else if (e && e.dimension) msg += ` (over your ${e.dimension} limit)`;
+    fail(msg);
+  }
   return json || {};
 }
 
