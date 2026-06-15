@@ -208,6 +208,39 @@ async function cmdReseller(pos, flags) {
 
 function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); return v; }
 
+// --- shell tab completion ---------------------------------------------------
+// `qc completion bash|zsh` prints a snippet that delegates back to
+// `qc __complete <cword> <words…>`, so completion always tracks the command tree.
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'job', 'reseller', 'completion', 'help', 'version'];
+const COMPLETE_SUB = {
+  vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete'],
+  job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
+};
+function cmdComplete(raw) {
+  const cword = parseInt(raw[0], 10) || 0;
+  const words = raw.slice(1).map(String);          // words[0] === 'qc'
+  const cur = words[cword] || '';
+  const cmd = (words[1] || '').toLowerCase();
+  const sub = (words[2] || '').toLowerCase();
+  let c = [];
+  if (cword <= 1) c = COMPLETE_TOP;
+  else if (cword === 2 && COMPLETE_SUB[cmd]) c = COMPLETE_SUB[cmd];
+  else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
+  else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
+  else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--no-ip'];
+  else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
+  else if (cmd === 'vm' && sub === 'delete' && cur.startsWith('-')) c = ['--yes'];
+  else if (cmd === 'reseller' && cur.startsWith('-')) c = ['--label', '--ext-ref', '--vcpu', '--ram', '--disk', '--ips', '--yes'];
+  process.stdout.write(c.filter((x) => x.startsWith(cur)).join('\n') + '\n');
+}
+function cmdCompletion(pos) {
+  const sh = (pos[0] || '').toLowerCase();
+  if (sh === 'bash') return say(`_qc() { local IFS=$'\\n'; COMPREPLY=( $(qc __complete "$COMP_CWORD" "\${COMP_WORDS[@]}" 2>/dev/null) ); }\ncomplete -F _qc qc`);
+  if (sh === 'zsh') return say(`_qc() { compadd -- \${(f)"$(qc __complete $((CURRENT-1)) \${words[@]} 2>/dev/null)"} }\ncompdef _qc qc`);
+  fail('usage: qc completion bash|zsh   (add `eval "$(qc completion bash)"` to your ~/.bashrc or ~/.zshrc)');
+}
+
 function help() {
   say(`qc ${VERSION} — QuickCloud CLI
 
@@ -232,9 +265,16 @@ Usage: qc <command> [args] [--json]
 
   reseller customers list|create|show|suspend|resume|delete|sso …   (reseller keys)
 
+  completion bash|zsh               print a shell tab-completion script
+
 Add --json to any command for machine-readable output.
+Tab completion:  add  eval "$(qc completion bash)"  (or zsh) to your shell rc.
 Auth: create a key in the panel → API, then:  qc config set token <key>`);
 }
+
+// Completion bridge — handled from the RAW argv (the words being completed can
+// look like flags, which the normal parser would swallow).
+if (process.argv[2] === '__complete') { cmdComplete(process.argv.slice(3)); process.exit(0); }
 
 const { pos, flags } = parseArgs(argv);
 const cmd = (pos.shift() || 'help').toLowerCase();
@@ -242,6 +282,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
   switch (cmd) {
     case 'help': case '-h': case '--help': return help();
     case 'version': case '-v': case '--version': return say(`qc ${VERSION}`);
+    case 'completion': return cmdCompletion(pos);
     case 'config': return cmdConfig(pos, flags);
     case 'whoami': case 'workspace': return cmdWhoami();
     case 'templates': return cmdTemplates();

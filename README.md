@@ -80,6 +80,22 @@ qc reseller customers create --label "Acme Ltd" --ext-ref 30960 \
 
 Run `qc help` for the full command list.
 
+## Tab completion
+
+`qc` ships shell completion for commands, sub-commands and flags. Enable it by
+adding one line to your shell's rc file:
+
+```sh
+# bash — in ~/.bashrc
+eval "$(qc completion bash)"
+
+# zsh — in ~/.zshrc
+eval "$(qc completion zsh)"
+```
+
+Open a new shell, then `qc <Tab>`, `qc vm <Tab>`, `qc vm create --<Tab>`, etc.
+(`qc` must be on your `PATH` for completion to work.)
+
 ## How it works
 
 `qc` is a thin client over the QuickCloud **v1 REST API**. Every command maps to a
