@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const VERSION = '1.0.0';
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
@@ -113,9 +114,22 @@ async function cmdWhoami() {
   });
 }
 
-async function cmdTemplates() {
+const FIELD_FLAG = { ciuser: '--user', password: '--password', sshkeys: '--ssh-key', user_data: '(cloud-init — panel only)' };
+async function cmdTemplates(pos) {
   const r = await api('GET', '/api/v1/templates');
   const t = r.templates || [];
+  const name = pos[0];
+  if (name) {                                   // qc templates <name> → show its inputs
+    const tpl = t.find((x) => x.name === name || (x.label || '').toLowerCase() === name.toLowerCase());
+    if (!tpl) fail(`no template named '${name}' — run: qc templates`);
+    return emit(tpl, () => {
+      say(`${tpl.name}  (${tpl.label || tpl.name})`);
+      const f = tpl.fields || {}; const keys = Object.keys(f);
+      if (!keys.length) return say('no inputs required.');
+      say('inputs for `vm create`:');
+      for (const k of keys) say(`  ${(f[k].required ? 'required' : 'optional').padEnd(9)} ${FIELD_FLAG[k] || `--${k}`}`);
+    });
+  }
   emit(r, () => (t.length ? table(['NAME', 'LABEL', 'FAMILY'], t.map((x) => [x.name, x.label || x.name, x.os_family || ''])) : say('no templates.')));
 }
 
@@ -137,7 +151,7 @@ async function cmdVm(pos, flags) {
     return emit(r, () => say(`${sub} queued (job ${r.job?.id}).`));
   }
   if (sub === 'create' || sub === 'new') {
-    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip]');
+    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip] [--wait]');
     if (!flags.os) fail('missing --os <template> — run `qc templates` to list them');
     const body = { name: flags.name, template: flags.os, vcpu: +flags.vcpu || 1, ram_mb: Math.round((+flags.ram || 1) * 1024), disk_gb: +flags.disk || 20, fields: {} };
     if (flags['no-ip']) body.ip = 'none';
@@ -145,7 +159,36 @@ async function cmdVm(pos, flags) {
     if (flags.password) body.fields.password = flags.password;
     if (flags['ssh-key']) body.fields.sshkeys = flags['ssh-key'];
     const r = await api('POST', '/api/v1/vms', body);
+    if (flags.wait && r.job?.id) {
+      if (!JSON_OUT) say(`creating '${body.name}' — VM #${r.vm?.id}, job ${r.job.id} …`);
+      const j = await pollJob(r.job.id);
+      if (j.status === 'failed') fail(`build failed — ${j.error || 'see panel'}`);
+      const d = await api('GET', `/api/v1/vms/${r.vm.id}`); const v = d.vm || {};
+      return emit(d, () => say(`ready: VM #${v.id} '${v.name}' [${v.status}]  ipv4: ${v.ipv4 || '—'}`));
+    }
     return emit(r, () => say(`creating '${body.name}' — VM #${r.vm?.id}, job ${r.job?.id}. Poll:  qc job get ${r.job?.id}`));
+  }
+  if (sub === 'wait') {
+    const id = need(pos[0], 'qc vm wait <id> [--status running|stopped]');
+    const want = (flags.status || '').toLowerCase();
+    for (;;) {
+      const r = await api('GET', `/api/v1/vms/${id}`); const st = r.vm?.status;
+      if (want ? st === want : (st === 'running' || st === 'stopped')) return emit(r, () => say(`VM #${id}: ${st}  ipv4: ${r.vm?.ipv4 || '—'}`));
+      await new Promise((res) => setTimeout(res, 1500));
+    }
+  }
+  if (sub === 'ssh') {
+    const id = need(pos[0], 'qc vm ssh <id> [--user u]');
+    const r = await api('GET', `/api/v1/vms/${id}`); const v = r.vm || {};
+    const host = v.ipv4 || v.ipv6;
+    if (!host) fail(`VM #${id} has no IP yet — try \`qc vm wait ${id}\` first`);
+    const user = flags.user || 'root';
+    const rest = pos.slice(1).filter((x) => x !== '--');
+    const args = [`${user}@${host}`, ...rest];
+    say(`ssh ${args.join(' ')}`);
+    const res = spawnSync('ssh', args, { stdio: 'inherit' });
+    if (res.error) fail(res.error.code === 'ENOENT' ? 'ssh not found on your PATH' : res.error.message);
+    process.exit(res.status == null ? 1 : res.status);
   }
   if (sub === 'rename') {
     const id = need(pos[0], 'qc vm rename <id> <name>'); const name = need(pos[1], 'qc vm rename <id> <name>');
@@ -168,7 +211,16 @@ async function cmdVm(pos, flags) {
     const r = await api('DELETE', `/api/v1/vms/${id}`);
     return emit(r, () => say(`delete queued (job ${r.job?.id}).`));
   }
-  fail(`unknown: vm ${sub} — try list, show, create, start, stop, shutdown, reboot, rename, resize, delete`);
+  fail(`unknown: vm ${sub} — try list, show, create, start, stop, shutdown, reboot, rename, resize, delete, wait, ssh`);
+}
+
+async function pollJob(id) {
+  for (;;) {
+    const r = await api('GET', `/api/v1/jobs/${id}`);
+    const st = r.job?.status;
+    if (st === 'done' || st === 'failed') return r.job;
+    await new Promise((res) => setTimeout(res, 1500));
+  }
 }
 
 async function cmdJob(pos) {
@@ -176,12 +228,8 @@ async function cmdJob(pos) {
   const id = need(pos[0], 'qc job get <id>   |   qc job wait <id>');
   if (sub === 'get') { const r = await api('GET', `/api/v1/jobs/${id}`); return emit(r, () => say(`job ${id}: ${r.job?.status}${r.job?.error ? ` — ${r.job.error}` : ''}`)); }
   if (sub === 'wait') {
-    for (;;) {
-      const r = await api('GET', `/api/v1/jobs/${id}`);
-      const st = r.job?.status;
-      if (st === 'done' || st === 'failed') return emit(r, () => say(`job ${id}: ${st}${r.job?.error ? ` — ${r.job.error}` : ''}`));
-      await new Promise((res) => setTimeout(res, 1500));
-    }
+    const j = await pollJob(id);
+    return emit({ job: j }, () => say(`job ${id}: ${j.status}${j.error ? ` — ${j.error}` : ''}`));
   }
   fail('usage: qc job get|wait <id>');
 }
@@ -213,7 +261,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
 const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'job', 'reseller', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
-  vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete'],
+  vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
 function cmdComplete(raw) {
@@ -228,8 +276,10 @@ function cmdComplete(raw) {
   else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
   else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
   else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
-  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--no-ip'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--no-ip', '--wait'];
   else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
+  else if (cmd === 'vm' && sub === 'wait' && cur.startsWith('-')) c = ['--status'];
+  else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
   else if (cmd === 'vm' && sub === 'delete' && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'reseller' && cur.startsWith('-')) c = ['--label', '--ext-ref', '--vcpu', '--ram', '--disk', '--ips', '--yes'];
   process.stdout.write(c.filter((x) => x.startsWith(cur)).join('\n') + '\n');
@@ -250,14 +300,17 @@ Usage: qc <command> [args] [--json]
   config set url|token <value>      configure the panel URL / API key
   whoami                            workspace, billing & quota
   templates                         OS templates you can launch from
+  templates <name>                  required inputs for one template
 
   vm list                           list your VMs
   vm show <id>                      VM detail
   vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template>
-            [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip]
+            [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip] [--wait]
   vm start|stop|shutdown|reboot <id>
   vm rename <id> <name>
   vm resize <id> [--vcpu n] [--ram GB] [--disk GB]
+  vm wait <id> [--status running|stopped]   block until VM reaches a state
+  vm ssh <id> [--user u] [-- ssh args…]     open an SSH session to the VM
   vm delete <id> --yes
 
   job get <id>                      check an async job
@@ -285,7 +338,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'completion': return cmdCompletion(pos);
     case 'config': return cmdConfig(pos, flags);
     case 'whoami': case 'workspace': return cmdWhoami();
-    case 'templates': return cmdTemplates();
+    case 'templates': return cmdTemplates(pos);
     case 'vm': return cmdVm(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);

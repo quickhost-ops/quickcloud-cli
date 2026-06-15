@@ -39,19 +39,34 @@ the `QC_API_TOKEN` and `QC_API_URL` environment variables, which take precedence
 ```sh
 qc whoami                       # workspace, billing & quota
 qc templates                    # OS templates you can launch from
+qc templates ubuntu-24          # required inputs for one template
 
 qc vm list
 qc vm show 101
 qc vm create --name web1 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 \
              --user ubuntu --password 'ChangeMe-123!' \
-             --ssh-key "ssh-ed25519 AAAA…"
+             --ssh-key "ssh-ed25519 AAAA…" --wait
 qc vm start|stop|shutdown|reboot 101
 qc vm rename 101 web-prod
 qc vm resize 101 --vcpu 4 --ram 8
+qc vm wait 101                  # block until the VM is running (or --status stopped)
+qc vm ssh 101 --user ubuntu     # SSH straight in using the VM's IP
 qc vm delete 101 --yes
 
 qc job wait 5567                # block until an async job finishes
 ```
+
+**Provision and connect in one go:**
+
+```sh
+qc vm create --name web1 --os ubuntu-24 --vcpu 2 --ram 4 --disk 40 \
+             --user ubuntu --password 'ChangeMe-123!' --wait
+qc vm ssh web1-id --user ubuntu
+```
+
+`--wait` blocks until the build job finishes and then prints the VM's IP.
+`qc vm ssh` looks up the VM's IP and hands off to your local `ssh` — anything
+after `--` is passed through (e.g. `qc vm ssh 101 -- -p 2222 uptime`).
 
 **Creating a VM:**
 
