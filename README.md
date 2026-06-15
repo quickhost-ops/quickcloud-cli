@@ -43,6 +43,7 @@ qc templates                    # OS templates you can launch from
 qc vm list
 qc vm show 101
 qc vm create --name web1 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 \
+             --user ubuntu --password 'ChangeMe-123!' \
              --ssh-key "ssh-ed25519 AAAA…"
 qc vm start|stop|shutdown|reboot 101
 qc vm rename 101 web-prod
@@ -51,6 +52,17 @@ qc vm delete 101 --yes
 
 qc job wait 5567                # block until an async job finishes
 ```
+
+**Creating a VM:**
+
+- `--os` takes the template **name** — run `qc templates` and use the value in the
+  `NAME` column (not the friendly label).
+- Each template decides which inputs it needs. Many require a **username**
+  (`--user`) and **password** (`--password`) as well as / instead of an
+  `--ssh-key`. If you miss one, the error tells you exactly which:
+  `error: … — ciuser is required, password is required` — just add that flag.
+- Quote values containing spaces or symbols (passwords, SSH keys) so your shell
+  passes them through intact.
 
 Add `--json` to any command for machine-readable output:
 
