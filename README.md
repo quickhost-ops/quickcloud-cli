@@ -9,17 +9,18 @@ cloud VMs straight from your shell — scriptable, pipeable, automatable.
 
 ## Install
 
-Requires **Node.js 18+**.
-
-Download it from your panel (the copy served there is pre-filled with your
-provider's URL):
+Requires **Node.js 18+**. It's a single file — feel free to read [`qc.mjs`](qc.mjs)
+first, then:
 
 ```sh
-curl -fsSL https://cloud.quickhost.uk/api/cli/qc.mjs -o qc && chmod +x qc
+curl -fsSL https://raw.githubusercontent.com/quickhost-ops/quickcloud-cli/main/qc.mjs -o qc && chmod +x qc
 sudo mv qc /usr/local/bin/        # optional: put it on your PATH
 ```
 
-…or grab [`qc.mjs`](qc.mjs) from this repo and `chmod +x qc.mjs`.
+> **Shortcut:** if your provider's panel offers a "Download qc" button, that copy
+> comes **pre-filled with the panel URL**, so you can skip `qc config set url`
+> below. The copy here defaults to `cloud.quickhost.uk` — set your own URL if your
+> provider uses a different domain.
 
 ## Configure
 
