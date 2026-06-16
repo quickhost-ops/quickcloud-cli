@@ -70,6 +70,19 @@ qc net detach 101 1                          # remove interface index 1 (see `qc
 qc net rm db-net --yes
 ```
 
+**Snapshots** (point-in-time, retention-bounded) **and backups** (durable, off-storage):
+
+```sh
+qc snap create 101 pre-upgrade               # disk-only; add --ram on a running VM
+qc snap list 101
+qc snap rollback 101 88 --yes                # reverts — discards changes since the snapshot
+qc snap rm 101 88
+
+qc backup create 101 --note nightly
+qc backup list 101                           # shows the volid you restore/delete by
+qc backup restore 101 'PBS1:backup/…' --yes  # in-place; overwrites the VM's disks
+qc backup rm 101 'PBS1:backup/…' --yes
+```
 
 **Provision and connect in one go:**
 

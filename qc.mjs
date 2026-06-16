@@ -87,6 +87,7 @@ function table(headers, rows) {
   rows.forEach((r) => say(r.map((c, i) => String(c ?? '').padEnd(w[i])).join('  ')));
 }
 const gb = (mb) => (mb >= 1024 ? `${mb / 1024}G` : `${mb}M`);
+const gib = (bytes) => (bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(1)}G` : `${Math.round(bytes / 1048576)}M`);
 
 // --- commands ---------------------------------------------------------------
 function cmdConfig(pos) {
@@ -306,15 +307,74 @@ async function cmdNet(pos, flags) {
   fail(`unknown: net ${sub} — try list, create, free-ips, attach, detach, rm`);
 }
 
+async function cmdSnap(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const id = need(pos[0], 'qc snap list <vm-id>');
+    const r = await api('GET', `/api/v1/vms/${id}/snapshots`); const snaps = r.snapshots || [];
+    return emit(r, () => (snaps.length ? table(['ID', 'LABEL', 'RAM', 'STATUS', 'EXPIRES'], snaps.map((x) => [x.id, x.label || '—', x.with_ram ? 'yes' : 'no', x.status, x.expires_at || '—'])) : say('no snapshots.')));
+  }
+  if (sub === 'create' || sub === 'new') {
+    const id = need(pos[0], 'qc snap create <vm-id> [<label>] [--ram]');
+    const r = await api('POST', `/api/v1/vms/${id}/snapshots`, { note: pos[1] || flags.note, with_ram: !!flags.ram });
+    return emit(r, () => say(`creating snapshot #${r.snapshot?.id} (job ${r.job?.id}). Poll:  qc job get ${r.job?.id}`));
+  }
+  if (sub === 'rollback' || sub === 'restore') {
+    const id = need(pos[0], 'qc snap rollback <vm-id> <snap-id>');
+    const snap = need(pos[1], 'qc snap rollback <vm-id> <snap-id>');
+    if (!flags.yes && !flags.force) fail(`rollback DISCARDS changes made since the snapshot — re-run:  qc snap rollback ${id} ${snap} --yes`);
+    const r = await api('POST', `/api/v1/vms/${id}/snapshots/${snap}/rollback`);
+    return emit(r, () => say(`rolling back to snapshot ${snap} (job ${r.job?.id}).`));
+  }
+  if (sub === 'rm' || sub === 'delete') {
+    const id = need(pos[0], 'qc snap rm <vm-id> <snap-id>');
+    const snap = need(pos[1], 'qc snap rm <vm-id> <snap-id>');
+    const r = await api('DELETE', `/api/v1/vms/${id}/snapshots/${snap}`);
+    return emit(r, () => say(`deleting snapshot ${snap} (job ${r.job?.id}).`));
+  }
+  fail(`unknown: snap ${sub} — try list, create, rollback, rm`);
+}
+
+async function cmdBackup(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const id = need(pos[0], 'qc backup list <vm-id>');
+    const r = await api('GET', `/api/v1/vms/${id}/backups`); const bks = r.backups || [];
+    return emit(r, () => (bks.length ? table(['CREATED', 'SIZE', 'NOTES', 'VOLID'], bks.map((b) => [b.created_at || '—', b.size != null ? gib(b.size) : '—', b.notes || '—', b.volid])) : say('no backups.')));
+  }
+  if (sub === 'create' || sub === 'new') {
+    const id = need(pos[0], 'qc backup create <vm-id> [--note "…"]');
+    const r = await api('POST', `/api/v1/vms/${id}/backups`, { note: flags.note });
+    return emit(r, () => say(`backup queued for VM ${id} (job ${r.job?.id}). Poll:  qc job get ${r.job?.id}`));
+  }
+  if (sub === 'restore') {
+    const id = need(pos[0], 'qc backup restore <vm-id> <volid>');
+    const volid = need(pos[1], 'qc backup restore <vm-id> <volid>');
+    if (!flags.yes && !flags.force) fail(`restore OVERWRITES the VM disks from the backup — re-run:  qc backup restore ${id} '${volid}' --yes`);
+    const r = await api('POST', `/api/v1/vms/${id}/backups/restore`, { volid });
+    return emit(r, () => say(`restoring VM ${id} from backup (job ${r.job?.id}).`));
+  }
+  if (sub === 'rm' || sub === 'delete') {
+    const id = need(pos[0], 'qc backup rm <vm-id> <volid>');
+    const volid = need(pos[1], 'qc backup rm <vm-id> <volid>');
+    if (!flags.yes && !flags.force) fail(`re-run with --yes to delete the backup:  qc backup rm ${id} '${volid}' --yes`);
+    const r = await api('DELETE', `/api/v1/vms/${id}/backups`, { volid });
+    return emit(r, () => say(`deleting backup (job ${r.job?.id}).`));
+  }
+  fail(`unknown: backup ${sub} — try list, create, restore, rm`);
+}
+
 function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); return v; }
 
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'job', 'reseller', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'job', 'reseller', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
+  snap: ['list', 'create', 'rollback', 'rm'],
+  backup: ['list', 'create', 'restore', 'rm'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
 function cmdComplete(raw) {
@@ -333,6 +393,10 @@ function cmdComplete(raw) {
   else if (cmd === 'net' && sub === 'create' && cur.startsWith('-')) c = ['--cidr', '--gateway'];
   else if (cmd === 'net' && sub === 'attach' && cur.startsWith('-')) c = ['--ip'];
   else if (cmd === 'net' && sub === 'rm' && cur.startsWith('-')) c = ['--yes'];
+  else if (cmd === 'snap' && sub === 'create' && cur.startsWith('-')) c = ['--ram', '--note'];
+  else if (cmd === 'snap' && (sub === 'rollback' || sub === 'rm') && cur.startsWith('-')) c = ['--yes'];
+  else if (cmd === 'backup' && sub === 'create' && cur.startsWith('-')) c = ['--note'];
+  else if (cmd === 'backup' && (sub === 'restore' || sub === 'rm') && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
   else if (cmd === 'vm' && sub === 'wait' && cur.startsWith('-')) c = ['--status'];
   else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
@@ -378,6 +442,16 @@ Usage: qc <command> [args] [--json]
   net detach <vm-id> <nic-index>    remove an interface from a VM
   net rm <network> --yes            delete a private network
 
+  snap list <vm-id>                 list snapshots
+  snap create <vm-id> [<label>] [--ram]     point-in-time snapshot
+  snap rollback <vm-id> <snap-id> --yes     revert (discards later changes)
+  snap rm <vm-id> <snap-id>
+
+  backup list <vm-id>               list durable (off-storage) backups
+  backup create <vm-id> [--note "…"]
+  backup restore <vm-id> <volid> --yes      in-place restore (overwrites disks)
+  backup rm <vm-id> <volid> --yes
+
   job get <id>                      check an async job
   job wait <id>                     block until a job finishes
 
@@ -406,6 +480,8 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'templates': return cmdTemplates(pos);
     case 'vm': return cmdVm(pos, flags);
     case 'net': return cmdNet(pos, flags);
+    case 'snap': case 'snapshot': return cmdSnap(pos, flags);
+    case 'backup': return cmdBackup(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
     default: fail(`unknown command: ${cmd} (try: qc help)`);
