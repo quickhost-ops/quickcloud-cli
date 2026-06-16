@@ -151,13 +151,15 @@ async function cmdVm(pos, flags) {
     return emit(r, () => say(`${sub} queued (job ${r.job?.id}).`));
   }
   if (sub === 'create' || sub === 'new') {
-    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip] [--wait]');
+    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--no-ip] [--wait]');
     if (!flags.os) fail('missing --os <template> — run `qc templates` to list them');
     const body = { name: flags.name, template: flags.os, vcpu: +flags.vcpu || 1, ram_mb: Math.round((+flags.ram || 1) * 1024), disk_gb: +flags.disk || 20, fields: {} };
     if (flags['no-ip']) body.ip = 'none';
     if (flags.user) body.fields.ciuser = flags.user;
     if (flags.password) body.fields.password = flags.password;
     if (flags['ssh-key']) body.fields.sshkeys = flags['ssh-key'];
+    if (flags['user-data']) body.fields.user_data = flags['user-data'];
+    else if (flags['user-data-file']) { try { body.fields.user_data = fs.readFileSync(flags['user-data-file'], 'utf8'); } catch (e) { fail(`cannot read --user-data-file: ${e.message}`); } }
     const r = await api('POST', '/api/v1/vms', body);
     if (flags.wait && r.job?.id) {
       if (!JSON_OUT) say(`creating '${body.name}' — VM #${r.vm?.id}, job ${r.job.id} …`);
@@ -276,7 +278,7 @@ function cmdComplete(raw) {
   else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
   else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
   else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
-  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--no-ip', '--wait'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--no-ip', '--wait'];
   else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
   else if (cmd === 'vm' && sub === 'wait' && cur.startsWith('-')) c = ['--status'];
   else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
@@ -305,7 +307,9 @@ Usage: qc <command> [args] [--json]
   vm list                           list your VMs
   vm show <id>                      VM detail
   vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template>
-            [--ssh-key "<pub>"] [--user u] [--password p] [--no-ip] [--wait]
+            [--ssh-key "<pub>"] [--user u] [--password p]
+            [--user-data-file <path>] [--no-ip] [--wait]
+                                    --user-data-file: cloud-init run on first boot
   vm start|stop|shutdown|reboot <id>
   vm rename <id> <name>
   vm resize <id> [--vcpu n] [--ram GB] [--disk GB]

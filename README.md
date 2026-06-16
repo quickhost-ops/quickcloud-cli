@@ -1,7 +1,8 @@
 # quickcloud-cli (`qc`)
 
-A tiny, **zero-dependency** command-line tool for the QuickCloud API. Manage your
-cloud VMs straight from your shell — scriptable, pipeable, automatable.
+A tiny, **zero-dependency** command-line tool for the QuickHost QuickCloud API
+(https://quickcloud.uk). Manage your cloud VMs straight from your shell —
+scriptable, pipeable, automatable.
 
 > **Read before you run.** `qc` is a single, self-contained file. It has no
 > dependencies and contains **no secrets** — it reads your API key from *your own*
@@ -45,7 +46,8 @@ qc vm list
 qc vm show 101
 qc vm create --name web1 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 \
              --user ubuntu --password 'ChangeMe-123!' \
-             --ssh-key "ssh-ed25519 AAAA…" --wait
+             --ssh-key "ssh-ed25519 AAAA…" \
+             --user-data-file cloud-init.yml --wait
 qc vm start|stop|shutdown|reboot 101
 qc vm rename 101 web-prod
 qc vm resize 101 --vcpu 4 --ram 8
@@ -78,6 +80,10 @@ after `--` is passed through (e.g. `qc vm ssh 101 -- -p 2222 uptime`).
   `error: … — ciuser is required, password is required` — just add that flag.
 - Quote values containing spaces or symbols (passwords, SSH keys) so your shell
   passes them through intact.
+- `--user-data-file` takes a path to a cloud-init document (a `#cloud-config`
+  YAML or a script) that runs on the VM's **first boot** — use it to install and
+  configure software unattended. Max 60 KB; not available for ISO installs. Treat
+  the file as sensitive if it contains secrets.
 
 Add `--json` to any command for machine-readable output:
 
