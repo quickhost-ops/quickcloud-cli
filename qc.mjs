@@ -143,7 +143,7 @@ async function cmdVm(pos, flags) {
   if (sub === 'get' || sub === 'show') {
     const id = need(pos[0], 'qc vm show <id>');
     const r = await api('GET', `/api/v1/vms/${id}`); const v = r.vm || {};
-    return emit(r, () => { say(`#${v.id}  ${v.name}  [${v.status}]`); say(`spec  : ${v.vcpu} vCPU · ${gb(v.ram_mb)} RAM · ${v.disk_gb}G disk`); say(`ipv4  : ${v.ipv4 || '—'}`); if (v.ipv6) say(`ipv6  : ${v.ipv6}`); });
+    return emit(r, () => { say(`#${v.id}  ${v.name}  [${v.status}]`); say(`spec  : ${v.vcpu} vCPU · ${gb(v.ram_mb)} RAM · ${v.disk_gb}G disk`); say(`ipv4  : ${v.ipv4 || '—'}`); if (v.ipv6) say(`ipv6  : ${v.ipv6}`); for (const p of v.priv_ips || []) say(`priv  : ${p.address}  (${p.network})`); });
   }
   if (powers[sub]) {
     const id = need(pos[0], `qc vm ${sub} <id>`);
@@ -151,7 +151,7 @@ async function cmdVm(pos, flags) {
     return emit(r, () => say(`${sub} queued (job ${r.job?.id}).`));
   }
   if (sub === 'create' || sub === 'new') {
-    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--no-ip] [--wait]');
+    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--priv-net <id>] [--no-ip] [--wait]');
     if (!flags.os) fail('missing --os <template> — run `qc templates` to list them');
     const body = { name: flags.name, template: flags.os, vcpu: +flags.vcpu || 1, ram_mb: Math.round((+flags.ram || 1) * 1024), disk_gb: +flags.disk || 20, fields: {} };
     if (flags['no-ip']) body.ip = 'none';
@@ -160,6 +160,7 @@ async function cmdVm(pos, flags) {
     if (flags['ssh-key']) body.fields.sshkeys = flags['ssh-key'];
     if (flags['user-data']) body.fields.user_data = flags['user-data'];
     else if (flags['user-data-file']) { try { body.fields.user_data = fs.readFileSync(flags['user-data-file'], 'utf8'); } catch (e) { fail(`cannot read --user-data-file: ${e.message}`); } }
+    if (flags['priv-net']) body.privNics = [{ networkId: +flags['priv-net'], ip: flags['priv-ip'] || undefined }];
     const r = await api('POST', '/api/v1/vms', body);
     if (flags.wait && r.job?.id) {
       if (!JSON_OUT) say(`creating '${body.name}' — VM #${r.vm?.id}, job ${r.job.id} …`);
@@ -256,14 +257,64 @@ async function cmdReseller(pos, flags) {
   fail(`unknown: reseller customers ${sub}`);
 }
 
+// Resolve a private network by numeric id or unique label (so `qc net attach
+// web-2 db-net` works as well as by id).
+async function resolveNet(arg) {
+  if (/^\d+$/.test(String(arg))) return +arg;
+  const r = await api('GET', '/api/v1/networks');
+  const hits = (r.networks || []).filter((n) => n.label === arg);
+  if (hits.length === 1) return hits[0].id;
+  if (!hits.length) fail(`no private network named '${arg}' — run \`qc net list\``);
+  fail(`multiple networks named '${arg}' — use the numeric id (qc net list)`);
+}
+
+async function cmdNet(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/networks'); const nets = r.networks || [];
+    return emit(r, () => (nets.length ? table(['ID', 'LABEL', 'CIDR', 'GATEWAY', 'VNET'], nets.map((n) => [n.id, n.label, n.cidr, n.gateway || '—', n.vnet])) : say('no private networks.')));
+  }
+  if (sub === 'create' || sub === 'new') {
+    const label = need(pos[0] || flags.label, 'qc net create <label> --cidr <CIDR> [--gateway <ip>]');
+    if (!flags.cidr) fail('missing --cidr <CIDR> — e.g. 10.20.0.0/24');
+    const r = await api('POST', '/api/v1/networks', { label, cidr: flags.cidr, gateway: flags.gateway });
+    return emit(r, () => say(`created network #${r.network?.id} '${r.network?.label}' (${r.network?.cidr}).`));
+  }
+  if (sub === 'free-ips' || sub === 'ips') {
+    const id = await resolveNet(need(pos[0], 'qc net free-ips <network>'));
+    const r = await api('GET', `/api/v1/networks/${id}/free-ips`);
+    return emit(r, () => say((r.ips || []).join('\n') || 'none free.'));
+  }
+  if (sub === 'rm' || sub === 'delete') {
+    const id = await resolveNet(need(pos[0], 'qc net rm <network>'));
+    if (!flags.yes && !flags.force) fail(`refusing without confirmation — re-run:  qc net rm ${id} --yes`);
+    const r = await api('DELETE', `/api/v1/networks/${id}`);
+    return emit(r, () => say(`deleted network ${id}.`));
+  }
+  if (sub === 'attach') {
+    const vm = need(pos[0], 'qc net attach <vm-id> <network> [--ip <addr>]');
+    const net = await resolveNet(need(pos[1], 'qc net attach <vm-id> <network> [--ip <addr>]'));
+    const r = await api('POST', `/api/v1/vms/${vm}/nics`, { network: net, ip: flags.ip });
+    return emit(r, () => say(`attaching network ${net} to VM ${vm} (job ${r.job?.id}). Poll:  qc job get ${r.job?.id}`));
+  }
+  if (sub === 'detach') {
+    const vm = need(pos[0], 'qc net detach <vm-id> <nic-index>   (see `qc vm show <id>` for indices)');
+    const nic = need(pos[1], 'qc net detach <vm-id> <nic-index>');
+    const r = await api('DELETE', `/api/v1/vms/${vm}/nics/${nic}`);
+    return emit(r, () => say(`detaching NIC ${nic} from VM ${vm} (job ${r.job?.id}).`));
+  }
+  fail(`unknown: net ${sub} — try list, create, free-ips, attach, detach, rm`);
+}
+
 function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); return v; }
 
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'job', 'reseller', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'job', 'reseller', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
+  net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
 function cmdComplete(raw) {
@@ -278,7 +329,10 @@ function cmdComplete(raw) {
   else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
   else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
   else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
-  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--no-ip', '--wait'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--priv-net', '--priv-ip', '--no-ip', '--wait'];
+  else if (cmd === 'net' && sub === 'create' && cur.startsWith('-')) c = ['--cidr', '--gateway'];
+  else if (cmd === 'net' && sub === 'attach' && cur.startsWith('-')) c = ['--ip'];
+  else if (cmd === 'net' && sub === 'rm' && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
   else if (cmd === 'vm' && sub === 'wait' && cur.startsWith('-')) c = ['--status'];
   else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
@@ -317,6 +371,13 @@ Usage: qc <command> [args] [--json]
   vm ssh <id> [--user u] [-- ssh args…]     open an SSH session to the VM
   vm delete <id> --yes
 
+  net list                          list your private networks
+  net create <label> --cidr <CIDR> [--gateway <ip>]
+  net free-ips <network>            free addresses in a network
+  net attach <vm-id> <network> [--ip <addr>]    add a private NIC to a VM
+  net detach <vm-id> <nic-index>    remove an interface from a VM
+  net rm <network> --yes            delete a private network
+
   job get <id>                      check an async job
   job wait <id>                     block until a job finishes
 
@@ -344,6 +405,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'whoami': case 'workspace': return cmdWhoami();
     case 'templates': return cmdTemplates(pos);
     case 'vm': return cmdVm(pos, flags);
+    case 'net': return cmdNet(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
     default: fail(`unknown command: ${cmd} (try: qc help)`);

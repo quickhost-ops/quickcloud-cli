@@ -58,6 +58,19 @@ qc vm delete 101 --yes
 qc job wait 5567                # block until an async job finishes
 ```
 
+**Private networks** (a backend tier — keep your DB off the public internet):
+
+```sh
+qc net create db-net --cidr 10.20.0.0/24
+qc net list
+qc net attach 101 db-net --ip 10.20.0.5      # hot-add a private NIC to a running VM
+qc vm create --name db1 --os ubuntu-24 --vcpu 2 --ram 4 --disk 40 \
+             --user ubuntu --password '…' --no-ip --priv-net 7   # backend-only, no public IP
+qc net detach 101 1                          # remove interface index 1 (see `qc vm show`)
+qc net rm db-net --yes
+```
+
+
 **Provision and connect in one go:**
 
 ```sh
