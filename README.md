@@ -58,6 +58,21 @@ qc vm delete 101 --yes
 qc job wait 5567                # block until an async job finishes
 ```
 
+**Cloud-init presets** (save your bootstrap document once — RMM agent, monitoring,
+hardening — and apply it to every new VM with one flag):
+
+```sh
+qc preset save deploy --file cloud-init.yml   # or:  cat cloud-init.yml | qc preset save deploy
+qc preset list
+qc vm create --name web02 --os ubuntu-24 --vcpu 2 --ram 4 --disk 40 \
+             --user ubuntu --password '…' --preset deploy --wait
+qc preset show deploy > cloud-init.yml        # round-trip it back out
+qc preset rm old-deploy --yes
+```
+
+`--preset` and `--user-data-file` are mutually exclusive — the preset *is* the
+user-data, stored in your workspace and resolved server-side at create time.
+
 **Private networks** (a backend tier — keep your DB off the public internet):
 
 ```sh
@@ -110,6 +125,9 @@ after `--` is passed through (e.g. `qc vm ssh 101 -- -p 2222 uptime`).
   YAML or a script) that runs on the VM's **first boot** — use it to install and
   configure software unattended. Max 60 KB; not available for ISO installs. Treat
   the file as sensitive if it contains secrets.
+- `--preset <name>` applies a **saved** cloud-init preset instead (see
+  `qc preset` above) — same rules as `--user-data-file`, but the document lives
+  in your workspace so every deploy uses the same, current copy.
 
 Add `--json` to any command for machine-readable output:
 

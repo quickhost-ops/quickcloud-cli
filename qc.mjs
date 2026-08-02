@@ -18,10 +18,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';   // 1.1.0: cloud-init presets (qc preset …, vm create --preset)
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
+const VC_FILE = path.join(CFG_DIR, 'version-check.json');   // cached update check
 
 const JSON_OUT = process.argv.includes('--json');
 const argv = process.argv.slice(2).filter((a) => a !== '--json');
@@ -79,6 +80,41 @@ async function api(method, p, body) {
     fail(msg);
   }
   return json || {};
+}
+
+// --- update check (best-effort, throttled, never blocks a command) ----------
+function semverGt(a, b) {
+  const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
+  return false;
+}
+// Returns the latest version string the panel offers, cached for a day so we
+// hit the network at most once daily. Offline → falls back to the last value we
+// learned (so a known update keeps reminding even without connectivity).
+async function latestVersion() {
+  let cache = {}; try { cache = JSON.parse(fs.readFileSync(VC_FILE, 'utf8')); } catch { /* none yet */ }
+  if (cache.checkedAt && Date.now() - cache.checkedAt < 86400000) return cache.latest || null;
+  try {
+    const { url } = cfg();
+    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(url + '/api/cli/version', { signal: ctrl.signal });
+    clearTimeout(t);
+    const j = await res.json().catch(() => ({}));
+    const latest = (j && j.version) || null;
+    try { fs.mkdirSync(CFG_DIR, { recursive: true }); fs.writeFileSync(VC_FILE, JSON.stringify({ checkedAt: Date.now(), latest })); } catch { /* ignore */ }
+    return latest;
+  } catch { return cache.latest || null; }
+}
+// Print an update notice to stderr (so it never pollutes stdout / --json).
+async function maybeNotifyUpdate() {
+  if (JSON_OUT) return;
+  try {
+    const latest = await latestVersion();
+    if (latest && semverGt(latest, VERSION)) {
+      const { url } = cfg();
+      process.stderr.write(`\n⬆ A new version of qc is available (${VERSION} → ${latest}).\n  Update:  curl -fsSL ${url}/api/cli/qc.mjs -o qc && chmod +x qc\n`);
+    }
+  } catch { /* never block the command on the update check */ }
 }
 
 function table(headers, rows) {
@@ -152,14 +188,16 @@ async function cmdVm(pos, flags) {
     return emit(r, () => say(`${sub} queued (job ${r.job?.id}).`));
   }
   if (sub === 'create' || sub === 'new') {
-    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--priv-net <id>] [--no-ip] [--wait]');
+    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--preset <name>] [--priv-net <id>] [--no-ip] [--wait]');
     if (!flags.os) fail('missing --os <template> — run `qc templates` to list them');
     const body = { name: flags.name, template: flags.os, vcpu: +flags.vcpu || 1, ram_mb: Math.round((+flags.ram || 1) * 1024), disk_gb: +flags.disk || 20, fields: {} };
     if (flags['no-ip']) body.ip = 'none';
     if (flags.user) body.fields.ciuser = flags.user;
     if (flags.password) body.fields.password = flags.password;
     if (flags['ssh-key']) body.fields.sshkeys = flags['ssh-key'];
-    if (flags['user-data']) body.fields.user_data = flags['user-data'];
+    if (flags.preset && (flags['user-data'] || flags['user-data-file'])) fail('--preset and --user-data/--user-data-file are mutually exclusive — the preset IS the user-data');
+    if (flags.preset) body.preset = flags.preset;   // a saved preset (qc preset list) — resolved server-side
+    else if (flags['user-data']) body.fields.user_data = flags['user-data'];
     else if (flags['user-data-file']) { try { body.fields.user_data = fs.readFileSync(flags['user-data-file'], 'utf8'); } catch (e) { fail(`cannot read --user-data-file: ${e.message}`); } }
     if (flags['priv-net']) body.privNics = [{ networkId: +flags['priv-net'], ip: flags['priv-ip'] || undefined }];
     const r = await api('POST', '/api/v1/vms', body);
@@ -364,17 +402,51 @@ async function cmdBackup(pos, flags) {
   fail(`unknown: backup ${sub} — try list, create, restore, rm`);
 }
 
+// Saved cloud-init presets — save a bootstrap document once (RMM agent,
+// monitoring, hardening), then `qc vm create --preset <name>` on every deploy.
+async function cmdPreset(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/presets'); const presets = r.presets || [];
+    return emit(r, () => (presets.length
+      ? table(['NAME', 'SIZE', 'UPDATED'], presets.map((p) => [p.name, `${Math.max(1, Math.round((p.bytes || 0) / 1024))}K`, (p.updated_at || p.created_at || '').slice(0, 16)]))
+      : say('no presets yet — save one:  qc preset save <name> --file cloud-init.yml')));
+  }
+  if (sub === 'save' || sub === 'set') {
+    const name = need(pos[0], 'qc preset save <name> --file <path>   (or pipe:  cat init.yml | qc preset save <name>)');
+    let content = '';
+    if (flags.file) { try { content = fs.readFileSync(flags.file, 'utf8'); } catch (e) { fail(`cannot read --file: ${e.message}`); } }
+    else if (!process.stdin.isTTY) { content = fs.readFileSync(0, 'utf8'); }
+    if (!content.trim()) fail('nothing to save — pass --file <path> or pipe the document on stdin');
+    const r = await api('PUT', `/api/v1/presets/${encodeURIComponent(name)}`, { content });
+    return emit(r, () => say(`${r.preset?.created ? 'saved' : 'updated'} '${r.preset?.name}' (${r.preset?.bytes} bytes). Use it:  qc vm create … --preset ${r.preset?.name}`));
+  }
+  if (sub === 'show' || sub === 'get' || sub === 'cat') {
+    const name = need(pos[0], 'qc preset show <name>');
+    const r = await api('GET', `/api/v1/presets/${encodeURIComponent(name)}`);
+    return emit(r, () => process.stdout.write(r.preset?.content || ''));   // raw — pipeable back to a file
+  }
+  if (sub === 'rm' || sub === 'delete') {
+    const name = need(pos[0], 'qc preset rm <name> --yes');
+    if (!flags.yes && !flags.force) fail(`refusing without confirmation — re-run:  qc preset rm ${name} --yes`);
+    const r = await api('DELETE', `/api/v1/presets/${encodeURIComponent(name)}`);
+    return emit(r, () => say(`deleted '${name}'. VMs already created from it are unaffected.`));
+  }
+  fail(`unknown: preset ${sub} — try list, save, show, rm`);
+}
+
 function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); return v; }
 
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'job', 'reseller', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'job', 'reseller', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
   snap: ['list', 'create', 'rollback', 'rm'],
   backup: ['list', 'create', 'restore', 'rm'],
+  preset: ['list', 'save', 'show', 'rm'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
 function cmdComplete(raw) {
@@ -389,7 +461,7 @@ function cmdComplete(raw) {
   else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
   else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
   else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
-  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--priv-net', '--priv-ip', '--no-ip', '--wait'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--preset', '--priv-net', '--priv-ip', '--no-ip', '--wait'];
   else if (cmd === 'net' && sub === 'create' && cur.startsWith('-')) c = ['--cidr', '--gateway'];
   else if (cmd === 'net' && sub === 'attach' && cur.startsWith('-')) c = ['--ip'];
   else if (cmd === 'net' && sub === 'rm' && cur.startsWith('-')) c = ['--yes'];
@@ -397,6 +469,8 @@ function cmdComplete(raw) {
   else if (cmd === 'snap' && (sub === 'rollback' || sub === 'rm') && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'backup' && sub === 'create' && cur.startsWith('-')) c = ['--note'];
   else if (cmd === 'backup' && (sub === 'restore' || sub === 'rm') && cur.startsWith('-')) c = ['--yes'];
+  else if (cmd === 'preset' && sub === 'save' && cur.startsWith('-')) c = ['--file'];
+  else if (cmd === 'preset' && sub === 'rm' && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'vm' && sub === 'resize' && cur.startsWith('-')) c = ['--vcpu', '--ram', '--disk'];
   else if (cmd === 'vm' && sub === 'wait' && cur.startsWith('-')) c = ['--status'];
   else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
@@ -426,8 +500,9 @@ Usage: qc <command> [args] [--json]
   vm show <id>                      VM detail
   vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template>
             [--ssh-key "<pub>"] [--user u] [--password p]
-            [--user-data-file <path>] [--no-ip] [--wait]
+            [--user-data-file <path>] [--preset <name>] [--no-ip] [--wait]
                                     --user-data-file: cloud-init run on first boot
+                                    --preset: a saved cloud-init preset (qc preset list)
   vm start|stop|shutdown|reboot <id>
   vm rename <id> <name>
   vm resize <id> [--vcpu n] [--ram GB] [--disk GB]
@@ -451,6 +526,11 @@ Usage: qc <command> [args] [--json]
   backup create <vm-id> [--note "…"]
   backup restore <vm-id> <volid> --yes      in-place restore (overwrites disks)
   backup rm <vm-id> <volid> --yes
+
+  preset list                       saved cloud-init presets (bootstrap documents)
+  preset save <name> --file <path>  save/update one (or pipe it on stdin)
+  preset show <name>                print its content
+  preset rm <name> --yes            delete it
 
   job get <id>                      check an async job
   job wait <id>                     block until a job finishes
@@ -482,8 +562,11 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'net': return cmdNet(pos, flags);
     case 'snap': case 'snapshot': return cmdSnap(pos, flags);
     case 'backup': return cmdBackup(pos, flags);
+    case 'preset': case 'presets': return cmdPreset(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
     default: fail(`unknown command: ${cmd} (try: qc help)`);
   }
-})().catch((e) => fail(e?.message || String(e)));
+})()
+  .then(() => { if (cmd !== 'completion') return maybeNotifyUpdate(); })
+  .catch((e) => fail(e?.message || String(e)));
