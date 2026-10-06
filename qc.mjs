@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.1.0';   // 1.1.0: cloud-init presets (qc preset …, vm create --preset)
+const VERSION = '1.4.0';   // 1.4.0: load balancers (qc lb …); 1.3.1: qc update; 1.3.0: Cloud Firewall; 1.2.0: dedicated servers + hosted DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -59,14 +59,14 @@ function parseArgs(args) {
   return { pos, flags };
 }
 
-async function api(method, p, body) {
+async function api(method, p, body, extraHeaders = {}) {
   const { url, token } = cfg();
   if (!token) fail('no API key set — run:  qc config set token <key>   (create one in the panel → API)');
   let res;
   try {
     res = await fetch(url + p, {
       method,
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, ...extraHeaders },
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) { fail(`could not reach ${url} (${e?.message || e})`); }
@@ -77,6 +77,9 @@ async function api(method, p, body) {
     let msg = (e && (e.message || e)) || `HTTP ${res.status}`;
     if (e && Array.isArray(e.fields) && e.fields.length) msg += ` — ${e.fields.map((f) => `${f.field} ${f.error}`).join(', ')}`;
     else if (e && e.dimension) msg += ` (over your ${e.dimension} limit)`;
+    if (e && e.need_terms) msg += '\n  accept the credit terms once in the panel (Billing) - the API cannot accept them for you.';
+    if (e && e.code === 'cleanup_fee') msg += '\n  re-run with --pay-cleanup-fee to accept the fee.';
+    if (e && e.code === 'plan_locked') msg += '\n  this needs a Pay-as-you-go workspace - switch in the panel (Billing).';
     fail(msg);
   }
   return json || {};
@@ -89,18 +92,22 @@ function semverGt(a, b) {
   return false;
 }
 // Returns the latest version string the panel offers, cached for a day so we
-// hit the network at most once daily. Offline → falls back to the last value we
-// learned (so a known update keeps reminding even without connectivity).
-async function latestVersion() {
+// hit the network sparingly: HOURLY while no update is known (the panel ships
+// several times a day - a day-long cache hid a release for a whole day, live
+// 2026-10-06), DAILY once one is (it keeps reminding; no need to re-ask).
+// Offline → falls back to the last value we learned. `force` skips the cache
+// (qc update / qc version --check).
+async function latestVersion(force = false) {
   let cache = {}; try { cache = JSON.parse(fs.readFileSync(VC_FILE, 'utf8')); } catch { /* none yet */ }
-  if (cache.checkedAt && Date.now() - cache.checkedAt < 86400000) return cache.latest || null;
+  const ttl = cache.latest && semverGt(cache.latest, VERSION) ? 86400000 : 3600000;
+  if (!force && cache.checkedAt && Date.now() - cache.checkedAt < ttl) return cache.latest || null;
   try {
     const { url } = cfg();
     const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 1500);
     const res = await fetch(url + '/api/cli/version', { signal: ctrl.signal });
     clearTimeout(t);
     const j = await res.json().catch(() => ({}));
-    const latest = (j && j.version) || null;
+    const latest = j && /^\d+\.\d+\.\d+$/.test(String(j.version || '')) ? j.version : null;   // only a real version number is ever cached or shown
     try { fs.mkdirSync(CFG_DIR, { recursive: true }); fs.writeFileSync(VC_FILE, JSON.stringify({ checkedAt: Date.now(), latest })); } catch { /* ignore */ }
     return latest;
   } catch { return cache.latest || null; }
@@ -112,7 +119,7 @@ async function maybeNotifyUpdate() {
     const latest = await latestVersion();
     if (latest && semverGt(latest, VERSION)) {
       const { url } = cfg();
-      process.stderr.write(`\n⬆ A new version of qc is available (${VERSION} → ${latest}).\n  Update:  curl -fsSL ${url}/api/cli/qc.mjs -o qc && chmod +x qc\n`);
+      process.stderr.write(`\n⬆ A new version of qc is available (${VERSION} → ${latest}).  Run:  qc update\n  (or by hand:  curl -fsSL ${url}/api/cli/qc.mjs -o qc && chmod +x qc)\n`);
     }
   } catch { /* never block the command on the update check */ }
 }
@@ -435,18 +442,507 @@ async function cmdPreset(pos, flags) {
   fail(`unknown: preset ${sub} — try list, save, show, rm`);
 }
 
+// --- dedicated servers -------------------------------------------------------
+// Bare metal leased by the hour: browse stock, buy, (re)install, power, rescue,
+// IPs, RAID. Hardware jobs are polled through the server's own job route.
+const money = (n) => (n == null ? '—' : `£${Number(n).toFixed(2)}`);
+// Stock rows carry cpu/ram_gb/disks flat; the owned-server detail carries the raw quick-spec JSON string.
+const specLine = (d) => { let o = d; if (typeof d === 'string') { try { o = JSON.parse(d); } catch { return d; } } return o && typeof o === 'object' ? ([o.cpu, o.ram_gb ? `${o.ram_gb} GB` : null, o.disks].filter(Boolean).join(' · ') || '—') : '—'; };
+// Install flags shared by `dedi buy --os` and `dedi reinstall`.
+function installBody(flags) {
+  const b = {};
+  if (flags.os) b.template = flags.os;
+  if (flags.hostname) b.hostname = flags.hostname;
+  if (flags.nameservers) b.nameservers = flags.nameservers;
+  if (flags.user) b.ssh_user = flags.user;
+  if (flags.password) b.ssh_password = flags.password;
+  if (flags['ssh-key']) b.ssh_keys = flags['ssh-key'];
+  if (flags['ssh-key-file']) b.ssh_keys = fs.readFileSync(flags['ssh-key-file'], 'utf8');
+  if (flags['root-ssh']) b.root_ssh = true;
+  if (flags.fs) b.fs = flags.fs;
+  return b;
+}
+async function pollDediJob(id, jobId) {
+  for (;;) {
+    const r = await api('GET', `/api/v1/dedicated/${id}/jobs/${jobId}`);
+    if (r.job?.done) return r.job;
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+}
+function sayArm(r) {
+  if (r.rootPassword) { say(`root / console password: ${r.rootPassword}`); say('  (shown ONCE - it is not retrievable later; re-arm if lost)'); }
+  if (r.sshLogin) say(`ssh login             : ${r.sshLogin}`);
+  if (r.until) say(`armed until           : ${r.until}`);
+  if (r.booting) say('booting into the installer now.');
+  else if (r.bootError) say(`not booted: ${r.bootError}`);
+  if (r.jobId) say(`boot job              : ${r.jobId}   (qc dedi job <id> ${r.jobId})`);
+}
+async function cmdDedi(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/dedicated'); const ds = r.dedicated || [];
+    return emit(r, () => (ds.length ? table(['ID', 'LABEL', 'MODEL', 'STATUS', 'POWER', 'OS', 'SITE'], ds.map((d) => [d.id, d.label, d.model || '—', d.suspension ? 'suspended' : d.status, d.power_state || '—', d.installed_os || '—', d.site_name || '—'])) : say('no dedicated servers.')));
+  }
+  if (sub === 'stock') {
+    const r = await api('GET', '/api/v1/dedicated/stock'); const st = r.stock || [];
+    return emit(r, () => {
+      if (!st.length) return say('nothing in stock right now.');
+      table(['ID', 'MODEL', 'SPEC', '£/HR', '£/MO MAX', 'SITE', 'OS CHOICES'], st.map((s) => [s.id, s.model || '—', specLine(s), Number(s.price_hr).toFixed(3), money(s.price_month_max ?? s.price_hr * 672), s.site || '—', (s.templates || []).filter((t) => !t.incompatible).map((t) => t.id).join(',') || '—']));
+      say(`\nminimum rental ${r.min_bill_hours}h, charged up front (you need credit for ${r.min_hours_credit}h).  Buy:  qc dedi buy <id> [--os <template> …]`);
+    });
+  }
+  if (sub === 'buy') {
+    const id = need(pos[0], 'qc dedi buy <stock-id> [--os <template> --hostname h --user u --password p | --ssh-key "<pub>"] [--no-boot] --yes');
+    if (!flags.yes) fail(`buying charges the minimum rental from your credit at once - re-run:  qc dedi buy ${id} … --yes`);
+    const body = installBody(flags);
+    if (flags['no-boot']) body.boot = false;
+    const r = await api('POST', `/api/v1/dedicated/stock/${id}/buy`, body, { 'Idempotency-Key': `qc-buy-${id}-${Date.now()}` });
+    return emit(r, () => {
+      say(`bought server #${r.id} (${r.label}) - ${money(r.charged)} charged for ${r.bill_hours}h, balance ${money(r.balance)}.`);
+      if (r.address) say(`ipv4                  : ${r.address}`);
+      if (r.ipNote) say(`note: ${r.ipNote}`);
+      if (r.installError) say(`install: ${r.installError}`);
+      sayArm(r);
+    });
+  }
+  const id = need(pos[0], `qc dedi ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/dedicated/${id}`); const d = r.server || {};
+    return emit(r, () => {
+      say(`#${d.id}  ${d.label}  [${d.suspension ? 'suspended' : d.status}]  ${d.model || ''}`);
+      say(`spec    : ${specLine(d.specs)}`);
+      say(`power   : ${d.power_state || '—'}${d.wall_power ? ` (wall ${d.wall_power})` : ''}   bmc: ${d.has_bmc ? 'yes' : 'no'}`);
+      say(`os      : ${d.installed_os || '—'}${d.pxe_armed ? `   [install armed: ${d.pxe_template}]` : d.pxe_rescue_armed ? '   [rescue armed]' : d.pxe_netboot_armed ? '   [netboot armed]' : ''}`);
+      for (const ip of d.ips || []) say(`ip      : ${ip.address}/${String(ip.cidr || '').split('/')[1] || ''}${ip.is_primary ? '  (primary)' : ''}${ip.ptr ? `  ptr ${ip.ptr}` : ''}   [#${ip.id}]`);
+      if ((d.raid_arrays || []).length) say(`raid    : ${d.raid_arrays.map((a) => `${a.level || a.raid || '?'} ${a.size_gb ? a.size_gb + 'G' : ''}`).join(', ')}`);
+      if (d.price_hr_micro) say(`price   : £${(d.price_hr_micro / 1e6).toFixed(3)}/h (hourly lease)`);
+      if (d.suspension) say(`SUSPENDED: ${d.suspension.reason || ''}${d.suspension.release_at ? ` - released ${d.suspension.release_at}` : ''}`);
+      say(`os templates: ${(d.templates || []).filter((t) => !t.incompatible).map((t) => t.id).join(', ') || '—'}`);
+    });
+  }
+  if (sub === 'reinstall') {
+    if (!flags.os) fail('usage: qc dedi reinstall <id> --os <template> [--hostname h] [--user u --password p | --ssh-key "<pub>" | --ssh-key-file p] [--root-ssh] [--fs ext4|xfs] [--boot] --yes');
+    if (!flags.yes) fail(`reinstall WIPES server ${id} - re-run with --yes`);
+    const body = installBody(flags); if (flags.boot) body.boot = true;
+    const r = await api('POST', `/api/v1/dedicated/${id}/reinstall`, body);
+    return emit(r, () => { say(`install armed on #${id}: ${r.templateName || flags.os}`); sayArm(r); if (!flags.boot) say('reboot the server to start it:  qc dedi reboot ' + id); });
+  }
+  const powers = { on: 'on', off: 'off', reboot: 'reboot', status: 'status' };
+  if (powers[sub]) {
+    const r = await api('POST', `/api/v1/dedicated/${id}/power`, { action: powers[sub] });
+    if (flags.wait && r.jobId) { const j = await pollDediJob(id, r.jobId); return emit({ ...r, job: j }, () => say(`${sub}: ${j.ok ? 'ok' : 'failed'}${j.power ? ` - power ${j.power}` : ''}${j.error ? ` - ${j.error}` : ''}`)); }
+    return emit(r, () => say(`${sub} queued (job ${r.jobId}).  qc dedi job ${id} ${r.jobId} --wait`));
+  }
+  if (sub === 'rescue' || sub === 'netboot') {
+    if (!flags.yes) fail(`this reboots server ${id} into the ${sub} system - re-run with --yes`);
+    const r = await api('POST', `/api/v1/dedicated/${id}/${sub}`, { boot: !flags['no-boot'] });
+    return emit(r, () => { say(`${sub} armed on #${id}.`); sayArm(r); });
+  }
+  if (sub === 'disarm') { const r = await api('POST', `/api/v1/dedicated/${id}/disarm`, {}); return emit(r, () => say(`disarmed - the next boot goes to local disk.`)); }
+  if (sub === 'console') {
+    const mode = (flags.mode || 'sol').toLowerCase();
+    const r = await api('POST', `/api/v1/dedicated/${id}/console`, { mode });
+    return emit(r, () => { say(`${mode} console session minted (single-use): ${r.session}`); say(`open it in the panel's console page - the tunnel is a browser websocket.`); });
+  }
+  if (sub === 'console-clear') { const r = await api('POST', `/api/v1/dedicated/${id}/console-clear`, {}); return emit(r, () => say(`clearing console sessions (job ${r.jobId}).`)); }
+  if (sub === 'bmc-reset') { if (!flags.yes) fail('re-run with --yes to reset the management controller'); const r = await api('POST', `/api/v1/dedicated/${id}/bmc-reset`, {}); return emit(r, () => say(`BMC reset queued (job ${r.jobId}).`)); }
+  if (sub === 'job') {
+    const jobId = need(pos[1], 'qc dedi job <id> <job-id> [--wait]');
+    const j = flags.wait ? await pollDediJob(id, jobId) : (await api('GET', `/api/v1/dedicated/${id}/jobs/${jobId}`)).job;
+    return emit({ job: j }, () => say(`job ${jobId}: ${j.done ? (j.ok ? 'done' : 'failed') : 'running'}${j.power ? ` - power ${j.power}` : ''}${j.storage_status ? ` - ${j.storage_status}` : ''}${j.error ? ` - ${j.error}` : ''}`));
+  }
+  if (sub === 'bandwidth' || sub === 'bw') {
+    const r = await api('GET', `/api/v1/dedicated/${id}/bandwidth?hours=${+flags.hours || 24}`);
+    return emit(r, () => { say(JSON.stringify({ bill: r.bill || null, over: r.over || null }, null, 2)); });
+  }
+  if (sub === 'ips') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/dedicated/${id}`); const ips = r.server?.ips || []; return emit({ ips }, () => table(['ID', 'ADDRESS', 'CIDR', 'GATEWAY', 'PRIMARY', 'PTR'], ips.map((i) => [i.id, i.address, i.cidr || '—', i.gateway || '—', i.is_primary ? 'yes' : '', i.ptr || '—']))); }
+    if (act === 'add') { const r = await api('POST', `/api/v1/dedicated/${id}/ips`, flags.address ? { address: flags.address } : {}); return emit(r, () => say(`added ${r.address || JSON.stringify(r)}`)); }
+    if (act === 'rm' || act === 'release') { const ipId = need(pos[2], 'qc dedi ips <id> rm <ip-id> --yes'); if (!flags.yes) fail('re-run with --yes to release the address'); const r = await api('DELETE', `/api/v1/dedicated/${id}/ips/${ipId}`, flags['pay-cleanup-fee'] ? { pay_cleanup_fee: true } : {}); return emit(r, () => say('released.')); }
+    if (act === 'primary') { const ipId = need(pos[2], 'qc dedi ips <id> primary <ip-id>'); const r = await api('POST', `/api/v1/dedicated/${id}/ips/${ipId}/primary`, {}); return emit(r, () => say('primary set.')); }
+    fail('usage: qc dedi ips <id> list|add [--address a]|rm <ip-id> --yes|primary <ip-id>');
+  }
+  if (sub === 'storage' || sub === 'raid') {
+    const act = (pos[1] || 'show').toLowerCase();
+    if (act === 'show') {
+      const r = await api('GET', `/api/v1/dedicated/${id}/storage`);
+      return emit(r, () => {
+        if (!r.discovered) return say(`no discovery yet${r.busy ? ' (one is running)' : ''} - run:  qc dedi storage ${id} discover`);
+        say(`discovered ${r.at}${r.busy ? '  [job running]' : ''}${r.health ? `   health: ${r.health.status}` : ''}${r.os_vd ? `   os array: ${r.os_vd}` : ''}`);
+        for (const c of r.controllers || []) say(`controller: ${c.fqdd || c.id || c.name || JSON.stringify(c)}`);
+        if ((r.arrays || []).length) table(['ARRAY', 'LEVEL', 'SIZE', 'STATE', 'DISKS'], r.arrays.map((a) => [a.fqdd || a.id, a.level || a.raid || '—', a.size_gb ? `${a.size_gb}G` : (a.size || '—'), a.state || '—', (a.disks || []).length]));
+        if ((r.disks || []).length) table(['DISK', 'SIZE', 'MEDIA', 'STATE'], r.disks.map((d) => [d.fqdd || d.id, d.size_gb ? `${d.size_gb}G` : (d.size || '—'), d.media || '—', d.state || '—']));
+      });
+    }
+    if (act === 'discover') { const r = await api('POST', `/api/v1/dedicated/${id}/storage/discover`, {}); return emit(r, () => say(`discovery queued (job ${r.jobId}) - then:  qc dedi storage ${id} show`)); }
+    if (act === 'apply') {
+      if (!flags.file) fail('usage: qc dedi storage <id> apply --file plan.json --yes   (plan: {"controller":"<fqdd>","arrays":[{"level":"RAID1","disks":["<fqdd>","<fqdd>"]}]})');
+      if (!flags.yes) fail('applying a RAID layout WIPES the arrays - re-run with --yes');
+      const r = await api('POST', `/api/v1/dedicated/${id}/storage/apply`, JSON.parse(fs.readFileSync(flags.file, 'utf8')));
+      return emit(r, () => say(`RAID apply queued (job ${r.jobId}).`));
+    }
+    if (act === 'boot-vd') { const vd = need(pos[2], 'qc dedi storage <id> boot-vd <array-fqdd>'); const r = await api('POST', `/api/v1/dedicated/${id}/storage/boot-vd`, { vd }); return emit(r, () => say(`boot array set (job ${r.jobId}).`)); }
+    fail('usage: qc dedi storage <id> show|discover|apply --file p --yes|boot-vd <fqdd>');
+  }
+  if (sub === 'release') {
+    if (!flags.yes) fail(`release hands server ${id} back and WIPES it; billing stops - re-run with --yes`);
+    const r = await api('POST', `/api/v1/dedicated/${id}/release`, {}, { 'Idempotency-Key': `qc-release-${id}-${Date.now()}` });
+    return emit(r, () => say(`released #${id}.${r.wiping ? ' wiping.' : ''}`));
+  }
+  fail(`unknown: dedi ${sub} - try list, stock, buy, show, reinstall, on, off, reboot, status, rescue, netboot, disarm, console, job, bandwidth, ips, storage, release`);
+}
+
+// --- Cloud Firewall -------------------------------------------------------------
+// A managed OPNsense appliance (or HA pair) in front of your servers: rules,
+// port forwards, VPN users, networks, 1:1 NAT, site-to-site tunnels.
+const idemKey = (what) => ({ 'Idempotency-Key': `qc-${what}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` });
+async function cmdFw(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/firewalls'); const fws = r.firewalls || [];
+    return emit(r, () => (fws.length ? table(['ID', 'LABEL', 'NAME', 'SIZE', 'HA', 'STATUS', 'WAN', 'LANS'], fws.map((f) => [f.id, f.label, f.name, f.size, f.ha ? 'yes' : '', f.status, (f.wan_ips || []).join(','), (f.lans || []).map((l) => l.cidr).join(',')])) : say('no firewalls.  Create one:  qc fw create --label edge --size small --yes')));
+  }
+  if (sub === 'sizes') {
+    const r = await api('GET', '/api/v1/firewalls');
+    return emit(r, () => { table(['SIZE', 'SPEC', '£/HR', '£/MO'], Object.keys(r.sizes || {}).map((k) => [k, `${r.sizes[k].vcpu} vCPU · ${gb(r.sizes[k].ram_mb)}`, r.prices?.[k]?.hourly ?? '—', r.prices?.[k]?.monthly ?? '—'])); say(`\nmin public IPs: single ${r.min_ips?.single}, HA pair ${r.min_ips?.ha} · max ${r.max_ips} IPs, ${r.max_lans} networks, ${r.max_per_ws} firewalls`); });
+  }
+  if (sub === 'create' || sub === 'new') {
+    if (!flags.label) fail('usage: qc fw create --label <name> [--size small|medium|large] [--ha] [--ips n] [--lan 10.90.0.0/24] [--no-dhcp] [--subnet <id> --address <ip>] --yes');
+    if (!flags.yes) fail('a firewall bills hourly from creation - re-run with --yes');
+    const body = { label: flags.label, size: flags.size || 'small', ha: !!flags.ha };
+    if (flags.ips) body.public_ips = +flags.ips;
+    if (flags.lan) body.lan_cidr = flags.lan;
+    if (flags['no-dhcp']) body.dhcp_enabled = false;
+    if (flags.subnet) { body.existing_subnet_id = +flags.subnet; if (flags.address) body.address = flags.address; }
+    if (flags.port) body.port_mbps = +flags.port;
+    const r = await api('POST', '/api/v1/firewalls', body, idemKey('fw-create'));
+    return emit(r, () => { say(`firewall #${r.firewall?.id} (${r.firewall?.name}) is building - job ${r.jobId}${r.jobIdB ? ` + ${r.jobIdB}` : ''}.`); if (r.admin_password) { say(`appliance admin password: ${r.admin_password}`); say('  (shown ONCE - store it now)'); } say(`watch:  qc fw show ${r.firewall?.id}`); });
+  }
+  const id = need(pos[0], `qc fw ${sub} <id>`);
+  const show = (r) => {
+    const f = r.firewall || {};
+    say(`#${f.id}  ${f.label}  (${f.name})  [${f.status}]  ${f.size}${f.ha ? ' · HA pair' : ''}`);
+    say(`wan     : ${(f.wan_ips || []).join(', ') || '—'}   admin ui: ${f.admin_access || 'any'}`);
+    for (const l of f.lans || []) say(`lan #${l.id}: ${l.label || 'LAN'}  ${l.cidr}  gw ${l.gateway}${l.dhcp_from ? `  dhcp ${l.dhcp_from}-${l.dhcp_to}` : ''}${(l.vms || []).length ? `  servers: ${l.vms.map((v) => `${v.name || v.vm_id}@${v.address || 'dhcp'}`).join(', ')}` : ''}`);
+    if ((f.rules || []).length) { say('rules   :'); table(['  ID', 'ACTION', 'PROTO', 'FROM', 'PORT', 'ON', 'LABEL'], f.rules.map((x) => ['  ' + x.id, x.action, x.proto, x.src_cidr || 'any', x.dport || '—', x.enabled ? 'yes' : 'no', x.label || ''])); }
+    if ((f.forwards || []).length) { say('forwards:'); table(['  ID', 'PROTO', 'PUBLIC', 'TARGET', 'ON', 'LABEL'], f.forwards.map((x) => ['  ' + x.id, x.proto, `${x.wan_ip}:${x.wan_port}`, `${x.dst_ip}:${x.dst_port}`, x.enabled ? 'yes' : 'no', x.label || ''])); }
+    if ((f.nat1 || []).length) { say('1:1 nat :'); table(['  ID', 'PUBLIC', 'TARGET', 'INBOUND', 'ON'], f.nat1.map((x) => ['  ' + x.id, x.wan_ip, x.dst_ip, x.inbound ? 'yes' : 'no', x.enabled ? 'yes' : 'no'])); }
+    if ((f.vpn_users || []).length) say(`vpn     : ${f.vpn_users.map((u) => `${u.username} (#${u.id}${u.profile_ready ? ', profile ready' : ''})`).join(', ')}`);
+    if ((f.tunnels || []).length) say(`tunnels : ${f.tunnels.map((t) => `${t.label} (#${t.id}, ${t.state || '?'})`).join(', ')}`);
+    if (f.cost) say(`cost    : ${money(f.cost.monthly_max)}/mo max · £${f.cost.hourly}/h`);
+    if (f.update?.available) say(`update  : OPNsense ${f.update.latest || ''} available -  qc fw update ${f.id} --yes`);
+  };
+  if (sub === 'show' || sub === 'get') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit(r, () => show(r)); }
+  if (sub === 'rename') { const label = need(pos[1], 'qc fw rename <id> <label>'); const r = await api('PATCH', `/api/v1/firewalls/${id}`, { label }); return emit(r, () => say(`renamed to ${r.firewall?.label}.`)); }
+  if (sub === 'set') {
+    const body = {};
+    if (flags['admin-access']) body.admin_access = flags['admin-access'];
+    if (flags.alerts != null) body.alerts = flags.alerts !== 'off' && flags.alerts !== 'false';
+    if (flags.port) body.port_mbps = +flags.port;
+    if (!Object.keys(body).length) fail('usage: qc fw set <id> [--admin-access any|rules] [--alerts on|off] [--port <mbps>]');
+    const r = await api('PATCH', `/api/v1/firewalls/${id}`, body); return emit(r, () => say('updated.'));
+  }
+  if (sub === 'rules' || sub === 'rule') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ rules: r.firewall?.rules || [] }, () => table(['ID', 'ACTION', 'PROTO', 'FROM', 'PORT', 'ON', 'LABEL'], (r.firewall?.rules || []).map((x) => [x.id, x.action, x.proto, x.src_cidr || 'any', x.dport || '—', x.enabled ? 'yes' : 'no', x.label || '']))); }
+    if (act === 'add') {
+      const body = { action: flags.block ? 'block' : 'pass', proto: flags.proto || 'tcp' };
+      if (flags.port) body.dport = String(flags.port);
+      if (flags.from) body.src_cidr = flags.from;
+      if (flags.label) body.label = flags.label;
+      if (!body.dport && !['icmp', 'any'].includes(body.proto)) fail('usage: qc fw rules <id> add --port 443 [--proto tcp|udp|icmp|any] [--from <cidr>] [--block] [--label "…"]');
+      const r = await api('POST', `/api/v1/firewalls/${id}/rules`, body); return emit(r, () => say(`rule added (${r.rules?.length} rules now).`));
+    }
+    const rid = need(pos[2], `qc fw rules <id> ${act} <rule-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/firewalls/${id}/rules/${rid}`); return emit(r, () => say('rule removed.')); }
+    if (act === 'enable' || act === 'disable') { const r = await api('PATCH', `/api/v1/firewalls/${id}/rules/${rid}`, { enabled: act === 'enable' }); return emit(r, () => say(`rule ${act}d.`)); }
+    fail('usage: qc fw rules <id> list|add|rm <rid>|enable <rid>|disable <rid>');
+  }
+  if (sub === 'forwards' || sub === 'forward') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ forwards: r.firewall?.forwards || [] }, () => table(['ID', 'PROTO', 'PUBLIC', 'TARGET', 'FROM', 'ON', 'LABEL'], (r.firewall?.forwards || []).map((x) => [x.id, x.proto, `${x.wan_ip}:${x.wan_port}`, `${x.dst_ip}:${x.dst_port}`, x.src_cidr || 'any', x.enabled ? 'yes' : 'no', x.label || '']))); }
+    if (act === 'add') {
+      if (!flags.port || !flags.to) fail('usage: qc fw forwards <id> add --port <public> --to <lan-ip>[:port] [--proto tcp|udp] [--wan-ip <ip>] [--lan <lan-id>] [--from <cidr>] [--label "…"]');
+      const [dst_ip, dst_port] = String(flags.to).split(':');
+      const body = { proto: flags.proto || 'tcp', wan_port: String(flags.port), dst_ip, dst_port: dst_port || String(flags.port) };
+      if (flags['wan-ip']) body.wan_ip = flags['wan-ip'];
+      if (flags.lan) body.lan_id = +flags.lan;
+      if (flags.from) body.src_cidr = flags.from;
+      if (flags.label) body.label = flags.label;
+      const r = await api('POST', `/api/v1/firewalls/${id}/forwards`, body); return emit(r, () => say(`forward added (${r.forwards?.length} now).`));
+    }
+    const fid = need(pos[2], `qc fw forwards <id> ${act} <forward-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/firewalls/${id}/forwards/${fid}`); return emit(r, () => say('forward removed.')); }
+    if (act === 'enable' || act === 'disable') { const r = await api('PATCH', `/api/v1/firewalls/${id}/forwards/${fid}`, { enabled: act === 'enable' }); return emit(r, () => say(`forward ${act}d.`)); }
+    fail('usage: qc fw forwards <id> list|add|rm <fid>|enable <fid>|disable <fid>');
+  }
+  if (sub === 'vpn') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ vpn_users: r.firewall?.vpn_users || [] }, () => table(['ID', 'USERNAME', 'SERIAL', 'PROFILE'], (r.firewall?.vpn_users || []).map((u) => [u.id, u.username, u.serial ?? '—', u.profile_ready ? 'ready - download once' : (u.profile_downloaded ? 'downloaded' : 'issuing…')]))); }
+    if (act === 'add') { const username = need(pos[2], 'qc fw vpn <id> add <username>'); const r = await api('POST', `/api/v1/firewalls/${id}/vpn-users`, { username }); return emit(r, () => say(`VPN user ${username} added - the appliance issues the certificate; then:  qc fw vpn ${id} profile <uid> --out ${username}.ovpn`)); }
+    const uid = need(pos[2], `qc fw vpn <id> ${act} <user-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/firewalls/${id}/vpn-users/${uid}`); return emit(r, () => say('VPN user removed.')); }
+    if (act === 'regenerate' || act === 'regen') { const r = await api('POST', `/api/v1/firewalls/${id}/vpn-users/${uid}/regenerate`, {}); return emit(r, () => say('new certificate issuing - download the new profile once it is ready.')); }
+    if (act === 'profile') { const out = flags.out || `vpn-${uid}.ovpn`; const text = await apiText(`/api/v1/firewalls/${id}/vpn-users/${uid}/profile`); fs.writeFileSync(out, text, { mode: 0o600 }); return say(`profile saved to ${out} (one-time download - the server copy is gone).`); }
+    fail('usage: qc fw vpn <id> list|add <username>|rm <uid>|regenerate <uid>|profile <uid> [--out file.ovpn]');
+  }
+  if (sub === 'lans' || sub === 'lan' || sub === 'networks') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ lans: r.firewall?.lans || [] }, () => table(['ID', 'LABEL', 'CIDR', 'GATEWAY', 'DHCP', 'SERVERS'], (r.firewall?.lans || []).map((l) => [l.id, l.label || 'LAN', l.cidr, l.gateway, l.dhcp_from ? `${l.dhcp_from}-${l.dhcp_to}` : 'off', (l.vms || []).map((v) => v.name || v.vm_id).join(',')]))); }
+    if (act === 'add') {
+      if (!flags.cidr && !flags.subnet) fail('usage: qc fw lans <id> add --cidr 10.91.0.0/24 [--label "…"] [--no-dhcp]   |   --subnet <id> --address <ip>');
+      const body = {};
+      if (flags.cidr) body.lan_cidr = flags.cidr;
+      if (flags.subnet) { body.subnet_id = +flags.subnet; body.address = flags.address; }
+      if (flags.label) body.label = flags.label;
+      if (flags['no-dhcp']) body.dhcp_enabled = false;
+      const r = await api('POST', `/api/v1/firewalls/${id}/lans`, body); return emit(r, () => say(`network added (${r.firewall?.lans?.length} now).`));
+    }
+    const lid = need(pos[2], `qc fw lans <id> ${act} <lan-id>`);
+    if (act === 'rm' || act === 'delete') { if (!flags.yes) fail('re-run with --yes to remove the network'); const r = await api('DELETE', `/api/v1/firewalls/${id}/lans/${lid}`); return emit(r, () => say('network removed.')); }
+    if (act === 'attach') { const vm = need(pos[3], 'qc fw lans <id> attach <lan-id> <vm-id> [--address <ip>]'); const body = { vm_id: +vm }; if (flags.address) { body.addr_mode = 'fixed'; body.address = flags.address; } const r = await api('POST', `/api/v1/firewalls/${id}/lans/${lid}/vms`, body); return emit(r, () => say(`VM ${vm} attached to network ${lid}.`)); }
+    if (act === 'detach') { const vm = need(pos[3], 'qc fw lans <id> detach <lan-id> <vm-id>'); const r = await api('DELETE', `/api/v1/firewalls/${id}/lans/${lid}/vms/${vm}`); return emit(r, () => say(`VM ${vm} detached.`)); }
+    if (act === 'private-only') { const vm = need(pos[3], 'qc fw lans <id> private-only <lan-id> <vm-id> --yes'); if (!flags.yes) fail(`this RELEASES VM ${vm}'s public IP - re-run with --yes`); const r = await api('POST', `/api/v1/firewalls/${id}/lans/${lid}/vms/${vm}/private-only`, {}); return emit(r, () => say(`VM ${vm} going private-only (job ${r.jobId || '?'}).`)); }
+    if (act === 'addresses' || act === 'free') { const r = await api('GET', `/api/v1/firewalls/${id}/lans/${lid}/addresses`); return emit(r, () => say(JSON.stringify(r, null, 2))); }
+    fail('usage: qc fw lans <id> list|add|rm <lid> --yes|attach <lid> <vm-id>|detach <lid> <vm-id>|private-only <lid> <vm-id> --yes|addresses <lid>');
+  }
+  if (sub === 'wan' || sub === 'ips') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ wan_addresses: r.firewall?.wan_addresses || [] }, () => table(['ID', 'ADDRESS', 'PRIMARY', 'NAT1', 'FORWARDS', 'REMOVABLE'], (r.firewall?.wan_addresses || []).map((a) => [a.id, a.address, a.primary ? 'yes' : '', a.nat1 ? a.nat1.dst_ip || 'yes' : '', a.forwards ?? 0, a.removable ? 'yes' : 'no']))); }
+    if (act === 'add') { const r = await api('POST', `/api/v1/firewalls/${id}/wan`, {}); return emit(r, () => say(`public address added: ${(r.firewall?.wan_ips || []).join(', ')}`)); }
+    if (act === 'rm' || act === 'delete') { const ipid = need(pos[2], 'qc fw wan <id> rm <ip-id> --yes'); if (!flags.yes) fail('re-run with --yes to release the address'); const r = await api('DELETE', `/api/v1/firewalls/${id}/wan/${ipid}`); return emit(r, () => say('address released.')); }
+    fail('usage: qc fw wan <id> list|add|rm <ip-id> --yes');
+  }
+  if (sub === 'nat1' || sub === 'nat') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}`); return emit({ nat1: r.firewall?.nat1 || [] }, () => table(['ID', 'PUBLIC', 'TARGET', 'INBOUND', 'ON', 'LABEL'], (r.firewall?.nat1 || []).map((x) => [x.id, x.wan_ip, x.dst_ip, x.inbound ? 'yes' : 'no', x.enabled ? 'yes' : 'no', x.label || '']))); }
+    if (act === 'add') {
+      if (!flags.to) fail('usage: qc fw nat1 <id> add --to <lan-ip> [--wan-ip <ip>|new] [--lan <lan-id>] [--no-inbound] [--label "…"]');
+      const body = { wan_ip: flags['wan-ip'] || 'new', dst_ip: flags.to, inbound: !flags['no-inbound'] };
+      if (flags.lan) body.lan_id = +flags.lan;
+      if (flags.label) body.label = flags.label;
+      const r = await api('POST', `/api/v1/firewalls/${id}/nat1`, body); return emit(r, () => say(`1:1 mapping added (${r.firewall?.nat1?.length} now).`));
+    }
+    const nid = need(pos[2], `qc fw nat1 <id> ${act} <nat-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/firewalls/${id}/nat1/${nid}`); return emit(r, () => say('mapping removed.')); }
+    fail('usage: qc fw nat1 <id> list|add|rm <nid>');
+  }
+  if (sub === 'tunnels' || sub === 'tunnel') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/firewalls/${id}/tunnels`); return emit(r, () => table(['ID', 'LABEL', 'REMOTE NETS', 'ENDPOINT', 'STATE', 'HANDSHAKE'], (r.tunnels || []).map((t) => [t.id, t.label, (t.remote_networks || []).join(','), t.endpoint || '—', t.state || '—', t.last_handshake || '—']))); }
+    if (act === 'add') {
+      if (!flags.label || !flags.remote) fail('usage: qc fw tunnels <id> add --label HQ --remote 192.168.1.0/24[,…] [--lans <lan-id,…>] [--endpoint host:port] [--peer-pubkey k] [--peer-fw <fw-id> --peer-lans <ids>]');
+      const body = { label: flags.label, remote_networks: String(flags.remote).split(','), lan_ids: flags.lans ? String(flags.lans).split(',').map(Number) : undefined, endpoint: flags.endpoint, peer_pubkey: flags['peer-pubkey'], peer_firewall_id: flags['peer-fw'] ? +flags['peer-fw'] : undefined, peer_lan_ids: flags['peer-lans'] ? String(flags['peer-lans']).split(',').map(Number) : undefined };
+      const r = await api('POST', `/api/v1/firewalls/${id}/tunnels`, body);
+      return emit(r, () => say(`tunnel #${r.tunnel?.id || '?'} added.${r.tunnel?.config_ready ? `  Far-end config (once):  qc fw tunnels ${id} config ${r.tunnel.id} --out hq.conf` : ''}`));
+    }
+    const tid = need(pos[2], `qc fw tunnels <id> ${act} <tunnel-id>`);
+    if (act === 'rm' || act === 'delete') { if (!flags.yes) fail('re-run with --yes to delete the tunnel'); const r = await api('DELETE', `/api/v1/firewalls/${id}/tunnels/${tid}`); return emit(r, () => say('tunnel deleted.')); }
+    if (act === 'enable' || act === 'disable') { const r = await api('PATCH', `/api/v1/firewalls/${id}/tunnels/${tid}`, { enabled: act === 'enable' }); return emit(r, () => say(`tunnel ${act}d.`)); }
+    if (act === 'regenerate' || act === 'regen') { const r = await api('POST', `/api/v1/firewalls/${id}/tunnels/${tid}/regenerate`, {}); return emit(r, () => say('new keys issued - download the far-end config again (once).')); }
+    if (act === 'config') { const out = flags.out || `tunnel-${tid}.conf`; const text = await apiText(`/api/v1/firewalls/${id}/tunnels/${tid}/config`); fs.writeFileSync(out, text, { mode: 0o600 }); return say(`far-end config saved to ${out} (one-time download - the private key is gone from the server).`); }
+    fail('usage: qc fw tunnels <id> list|add|rm <tid> --yes|enable <tid>|disable <tid>|regenerate <tid>|config <tid> [--out file]');
+  }
+  if (sub === 'reboot') { if (!flags.yes) fail('re-run with --yes to reboot the appliance(s)'); const r = await api('POST', `/api/v1/firewalls/${id}/reboot`, {}); return emit(r, () => say('reboot queued.')); }
+  if (sub === 'update') { if (!flags.yes) fail('re-run with --yes to apply the OPNsense update (the appliance reboots)'); const r = await api('POST', `/api/v1/firewalls/${id}/update`, {}); return emit(r, () => say('update started - watch:  qc fw show ' + id)); }
+  if (sub === 'traffic') { const r = await api('GET', `/api/v1/firewalls/${id}/traffic?range=${flags.range || '1h'}`); return emit(r, () => say(JSON.stringify(r, null, 2))); }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail(`deleting firewall ${id} destroys the appliance(s), releases its public IPs and detaches every server - re-run with --yes`); const r = await api('DELETE', `/api/v1/firewalls/${id}`, undefined, idemKey('fw-delete')); return emit(r, () => say(`firewall ${id} deleted.`)); }
+  fail(`unknown: fw ${sub} - try list, sizes, create, show, rename, set, rules, forwards, vpn, lans, wan, nat1, tunnels, reboot, update, traffic, delete`);
+}
+// A GET that returns a FILE (the one-time .ovpn / WireGuard downloads): the
+// body is text, not JSON, and a v1 error still arrives as the JSON envelope.
+async function apiText(p) {
+  const { url, token } = cfg();
+  if (!token) fail('no API key set — run:  qc config set token <key>');
+  let res; try { res = await fetch(url + p, { headers: { Authorization: `Bearer ${token}` } }); } catch (e) { fail(`could not reach ${url} (${e?.message || e})`); }
+  const text = await res.text();
+  if (!res.ok) { let j = null; try { j = JSON.parse(text); } catch { /* not json */ } fail((j && j.error && j.error.message) || `HTTP ${res.status}`); }
+  return text;
+}
+
+// --- load balancers -------------------------------------------------------------
+// Shared HAProxy fleet: an LB is a hostname (lb-<slug>.<base>); HTTP listeners
+// are Host-routed on :80/:443 with free managed certificates, TCP listeners
+// claim a port. Backends must be your own public addresses.
+async function cmdLb(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/lbs'); const lbs = r.lbs || [];
+    return emit(r, () => {
+      if (!lbs.length) return say(`no load balancers (${money(r.month_gbp)}/mo each).  Create one:  qc lb create --label web --yes`);
+      table(['ID', 'LABEL', 'HOSTNAME', 'STATUS', 'LISTENERS', 'BACKENDS', 'DOMAINS'], lbs.map((l) => [l.id, l.label, l.hostname, l.suspended ? 'suspended' : l.status, l.listeners, l.backends, `${l.domains_verified}/${l.domains}`]));
+      if ((r.fleet_ips || []).length) say(`\nfleet addresses: ${r.fleet_ips.join(', ')}${r.fleet_degraded ? '  (DEGRADED - some nodes down)' : ''}`);
+    });
+  }
+  if (sub === 'info' || sub === 'pricing' || sub === 'sizes') {
+    // No sizes: an LB lives on the shared fleet - one product, one price; the
+    // shape is what you put on it, within these limits.
+    const r = await api('GET', '/api/v1/lbs'); const st = r.settings || {};
+    return emit(r, () => {
+      say(`load balancer: ${money(r.month_gbp)}/mo max each, billed hourly - shared fleet, no sizes to pick`);
+      say(`limits       : ${st.max_lbs ?? '—'} load balancers · ${st.max_listeners ?? '—'} listeners each · ${st.max_backends ?? '—'} backends per listener · ${st.max_domains ?? '—'} custom domains each`);
+      say(`listeners    : HTTP on :80/:443 (Host-routed, free managed certificates) · TCP on ports ${st.tcp_port_min ?? '—'}-${st.tcp_port_max ?? '—'}`);
+      say(`fleet        : ${(r.fleet_ips || []).length ? r.fleet_ips.join(', ') + (r.fleet_degraded ? '  (DEGRADED)' : '') : '(addresses shown once you have a load balancer)'}${r.ready === false ? '   NOT READY - creation refused for now' : ''}`);
+    });
+  }
+  if (sub === 'create' || sub === 'new') {
+    if (!flags.label) fail('usage: qc lb create --label <name> --yes');
+    if (!flags.yes) fail('a load balancer bills hourly from creation - re-run with --yes');
+    const r = await api('POST', '/api/v1/lbs', { label: flags.label }, idemKey('lb-create'));
+    return emit(r, () => say(`load balancer #${r.lb?.id} created: ${r.lb?.hostname}\nnext:  qc lb listeners ${r.lb?.id} add --http   then   qc lb backends ${r.lb?.id} <listener-id> add --ip <your-ip> --port 8080`));
+  }
+  const id = need(pos[0], `qc lb ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/lbs/${id}`); const l = r.lb || {};
+    return emit(r, () => {
+      say(`#${l.id}  ${l.label}  ${l.hostname}  [${l.suspended ? 'suspended' : l.status}]${l.cost ? `  ${money(l.cost.monthly_max)}/mo max` : ''}`);
+      for (const li of l.listeners || []) {
+        say(`listener #${li.id}: ${li.protocol} :${li.port}  ${li.algorithm}${li.sticky ? ' sticky' : ''}${li.proxy_protocol ? ' proxy-protocol' : ''}  hc ${li.hc?.kind}${li.hc?.path ? ' ' + li.hc.path : ''} every ${li.hc?.interval_s}s${li.tls && li.tls.mode !== 'none' ? `  tls ${li.tls.mode}${li.tls.https_redirect ? ' +redirect' : ''}` : ''}`);
+        if ((li.backends || []).length) table(['  ID', 'ADDRESS', 'PORT', 'WEIGHT', 'ON', 'HEALTH', 'SESSIONS'], li.backends.map((b) => ['  ' + b.id, b.ip, b.port, b.weight, b.enabled ? 'yes' : 'drained', b.health?.status || '—', b.health?.sessions ?? '—']));
+        else say('  (no backends yet)');
+      }
+      if (!(l.listeners || []).length) say('no listeners yet.');
+      for (const d of l.domains || []) say(`domain  : ${d.domain}  ${d.verified ? 'verified' : 'NOT verified' + (d.last_error ? ` - ${d.last_error}` : '')}`);
+      for (const c of l.certs || []) say(`cert    : ${c.hostname}  ${c.state || c.status || ''}${c.not_after ? `  until ${c.not_after}` : ''}${c.resumes_at ? `  resumes ${c.resumes_at}` : ''}${c.error ? `  ${c.error}` : ''}`);
+    });
+  }
+  if (sub === 'rename') { const label = need(pos[1], 'qc lb rename <id> <label>'); const r = await api('PATCH', `/api/v1/lbs/${id}`, { label }); return emit(r, () => say(`renamed to ${r.lb?.label}.`)); }
+  if (sub === 'listeners' || sub === 'listener') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/lbs/${id}`); return emit({ listeners: r.lb?.listeners || [] }, () => table(['ID', 'PROTO', 'PORT', 'ALGO', 'STICKY', 'HC', 'TLS', 'BACKENDS'], (r.lb?.listeners || []).map((li) => [li.id, li.protocol, li.port, li.algorithm, li.sticky ? 'yes' : '', `${li.hc?.kind}${li.hc?.path ? ' ' + li.hc.path : ''}`, li.tls?.mode || 'none', (li.backends || []).length]))); }
+    if (act === 'add') {
+      const body = { protocol: flags.tcp ? 'tcp' : 'http' };
+      if (flags.port) body.port = +flags.port;
+      if (flags.algorithm) body.algorithm = flags.algorithm;
+      if (flags.sticky) body.sticky = true;
+      if (flags['proxy-protocol']) body.proxy_protocol = true;
+      if (flags['hc-path']) body.hc_path = flags['hc-path'];
+      if (flags['hc-status']) body.hc_status = +flags['hc-status'];
+      if (flags['hc-interval']) body.hc_interval_s = +flags['hc-interval'];
+      if (flags.tls) body.tls_mode = flags.tls;
+      if (flags.redirect) body.https_redirect = true;
+      if (flags['backend-port']) body.tls_backend_port = +flags['backend-port'];
+      if (body.protocol === 'tcp' && !body.port) fail('usage: qc lb listeners <id> add --tcp --port <n>   |   add --http [--tls managed|passthrough] [--redirect] [--algorithm roundrobin|leastconn|source] [--sticky] [--hc-path /healthz]');
+      const r = await api('POST', `/api/v1/lbs/${id}/listeners`, body);
+      const li = (r.lb?.listeners || []).slice(-1)[0];
+      return emit(r, () => say(`listener added${li ? ` (#${li.id}, ${li.protocol} :${li.port})` : ''}.`));
+    }
+    const lid = need(pos[2], `qc lb listeners <id> ${act} <listener-id>`);
+    if (act === 'rm' || act === 'delete') { if (!flags.yes) fail('re-run with --yes to remove the listener and its backends'); const r = await api('DELETE', `/api/v1/lbs/${id}/listeners/${lid}`); return emit(r, () => say('listener removed.')); }
+    if (act === 'set') {
+      const body = {};
+      if (flags.algorithm) body.algorithm = flags.algorithm;
+      if (flags.sticky != null) body.sticky = flags.sticky !== 'off' && flags.sticky !== 'false';
+      if (flags['proxy-protocol'] != null) body.proxy_protocol = flags['proxy-protocol'] !== 'off' && flags['proxy-protocol'] !== 'false';
+      if (flags['hc-path']) body.hc_path = flags['hc-path'];
+      if (flags['hc-status']) body.hc_status = +flags['hc-status'];
+      if (flags['hc-interval']) body.hc_interval_s = +flags['hc-interval'];
+      if (flags.tls) body.tls_mode = flags.tls;
+      if (flags.redirect != null) body.https_redirect = flags.redirect !== 'off' && flags.redirect !== 'false';
+      if (flags['backend-port']) body.tls_backend_port = +flags['backend-port'];
+      if (!Object.keys(body).length) fail('usage: qc lb listeners <id> set <lid> [--algorithm a] [--sticky on|off] [--hc-path p] [--hc-interval s] [--tls none|managed|passthrough] [--redirect on|off] [--backend-port n]');
+      const r = await api('PATCH', `/api/v1/lbs/${id}/listeners/${lid}`, body); return emit(r, () => say('listener updated.'));
+    }
+    fail('usage: qc lb listeners <id> list|add|set <lid>|rm <lid> --yes');
+  }
+  if (sub === 'backends' || sub === 'backend') {
+    const lid = need(pos[1], 'qc lb backends <id> <listener-id> list|add|set <bid>|drain <bid>|undrain <bid>|rm <bid>');
+    const act = (pos[2] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/lbs/${id}`); const li = (r.lb?.listeners || []).find((x) => String(x.id) === String(lid)); if (!li) fail(`listener ${lid} not found on LB ${id}`); return emit({ backends: li.backends }, () => table(['ID', 'ADDRESS', 'PORT', 'WEIGHT', 'ON', 'HEALTH', 'SESSIONS'], li.backends.map((b) => [b.id, b.ip, b.port, b.weight, b.enabled ? 'yes' : 'drained', b.health?.status || '—', b.health?.sessions ?? '—']))); }
+    if (act === 'add') { if (!flags.ip) fail('usage: qc lb backends <id> <lid> add --ip <your-public-ip> [--port n] [--weight 1-256]'); const body = { ip: flags.ip }; if (flags.port) body.port = +flags.port; if (flags.weight) body.weight = +flags.weight; const r = await api('POST', `/api/v1/lbs/${id}/listeners/${lid}/backends`, body); return emit(r, () => say('backend added.')); }
+    const bid = need(pos[3], `qc lb backends <id> <lid> ${act} <backend-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/lbs/${id}/listeners/${lid}/backends/${bid}`); return emit(r, () => say('backend removed.')); }
+    if (act === 'drain' || act === 'undrain') { const r = await api('PATCH', `/api/v1/lbs/${id}/listeners/${lid}/backends/${bid}`, { enabled: act === 'undrain' }); return emit(r, () => say(act === 'drain' ? 'backend drained (no new traffic).' : 'backend back in service.')); }
+    if (act === 'set') { const body = {}; if (flags.port) body.port = +flags.port; if (flags.weight) body.weight = +flags.weight; if (!Object.keys(body).length) fail('usage: qc lb backends <id> <lid> set <bid> [--port n] [--weight n]'); const r = await api('PATCH', `/api/v1/lbs/${id}/listeners/${lid}/backends/${bid}`, body); return emit(r, () => say('backend updated.')); }
+    fail('usage: qc lb backends <id> <lid> list|add --ip a [--port n]|set <bid>|drain <bid>|undrain <bid>|rm <bid>');
+  }
+  if (sub === 'domains' || sub === 'domain') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/lbs/${id}`); return emit({ domains: r.lb?.domains || [], certs: r.lb?.certs || [] }, () => table(['ID', 'DOMAIN', 'VERIFIED', 'LAST ERROR'], (r.lb?.domains || []).map((d) => [d.id, d.domain, d.verified ? 'yes' : 'no', d.last_error || '']))); }
+    if (act === 'add') { const domain = need(pos[2], 'qc lb domains <id> add <domain>'); const r = await api('POST', `/api/v1/lbs/${id}/domains`, { domain }); return emit(r, () => { const d = r.domain || {}; say(`domain ${d.domain} added - point it at the load balancer, then:  qc lb domains ${id} verify ${d.id}`); if (d.cname_target) say(`  CNAME  ${d.domain} → ${d.cname_target}`); if (d.txt_name) say(`  or TXT ${d.txt_name} = ${d.txt_value}  (apex domains: plus A/AAAA records to the fleet addresses)`); }); }
+    const did = need(pos[2], `qc lb domains <id> ${act} <domain-id>`);
+    if (act === 'verify' || act === 'check') { const r = await api('POST', `/api/v1/lbs/${id}/domains/${did}/verify`, {}); return emit(r, () => say(r.verified ? `verified${r.via ? ` (via ${r.via})` : ''} - a certificate follows within minutes.` : `not verified yet${r.error || r.last_error ? ` - ${r.error || r.last_error}` : ''}`)); }
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/lbs/${id}/domains/${did}`); return emit(r, () => say('domain removed.')); }
+    fail('usage: qc lb domains <id> list|add <domain>|verify <did>|rm <did>');
+  }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail(`deleting load balancer ${id} withdraws its hostname - every CNAME pointing at it stops working. Re-run with --yes`); const r = await api('DELETE', `/api/v1/lbs/${id}`, undefined, idemKey('lb-delete')); return emit(r, () => say(`load balancer ${id} deleted.`)); }
+  fail(`unknown: lb ${sub} - try list, info, create, show, rename, listeners, backends, domains, delete`);
+}
+
+// --- hosted DNS ---------------------------------------------------------------
+// Zones by id or name; record sets are whole-set upserts (Route-53 style), so
+// `qc dns set example.com www A 203.0.113.10 203.0.113.11` replaces the set.
+async function cmdDns(pos, flags) {
+  const sub = (pos.shift() || 'zones').toLowerCase();
+  if (sub === 'zones' || sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/dns/zones'); const zs = r.zones || [];
+    return emit(r, () => { if (r.ns_hosts) say(`nameservers: ${r.ns_hosts.join(', ')}`); zs.length ? table(['ID', 'ZONE', 'STATUS', 'SERIAL', 'DELEGATED', 'RRSETS'], zs.map((z) => [z.id, z.name, z.status, z.serial, z.delegation_ok == null ? '—' : (z.delegation_ok ? 'yes' : 'NO'), z.rrsets])) : say('no zones.'); });
+  }
+  if (sub === 'add' || sub === 'create') { const name = need(pos[0], 'qc dns add <domain>'); const r = await api('POST', '/api/v1/dns/zones', { name }, { 'Idempotency-Key': `qc-zone-${name}` }); return emit(r, () => say(`zone #${r.zone?.id} ${r.zone?.name} added.`)); }
+  const zone = need(pos[0], `qc dns ${sub} <zone>`);
+  if (sub === 'show' || sub === 'records' || sub === 'get') {
+    const r = await api('GET', `/api/v1/dns/zones/${encodeURIComponent(zone)}`); const z = r.zone || {}; const sets = z.rrsets || [];
+    return emit(r, () => { say(`#${z.id}  ${z.name}  serial ${z.serial ?? '—'}`); sets.length ? table(['ID', 'NAME', 'TYPE', 'TTL', 'POLICY', 'RECORDS'], sets.map((s) => [s.id, s.name || '@', s.type, s.ttl, s.policy || 'simple', (s.records || []).map((x) => x.content + (x.weight ? ` (w${x.weight})` : '') + (x.failover_role ? ` (${x.failover_role})` : '')).join(' | ')])) : say('no record sets.'); });
+  }
+  if (sub === 'set') {
+    const name = need(pos[1], 'qc dns set <zone> <name|@> <TYPE> <value…> [--ttl n]'); const type = need(pos[2], 'qc dns set <zone> <name|@> <TYPE> <value…>').toUpperCase();
+    const values = pos.slice(3); if (!values.length) fail('give at least one value');
+    const body = { name, type, records: values, ...(flags.ttl ? { ttl: +flags.ttl } : {}) };
+    const r = await api('PUT', `/api/v1/dns/zones/${encodeURIComponent(zone)}/rrsets`, body);
+    return emit(r, () => say(`${name} ${type} set (${values.length} record${values.length === 1 ? '' : 's'}); zone serial ${r.zone?.serial ?? '—'}.`));
+  }
+  if (sub === 'rm' || sub === 'delete-record') { const rr = need(pos[1], 'qc dns rm <zone> <name:TYPE|rrset-id>'); const r = await api('DELETE', `/api/v1/dns/zones/${encodeURIComponent(zone)}/rrsets/${encodeURIComponent(rr)}`); return emit(r, () => say(`removed ${rr}.`)); }
+  if (sub === 'check') { const r = await api('POST', `/api/v1/dns/zones/${encodeURIComponent(zone)}/check-delegation`, {}); return emit(r, () => say(JSON.stringify(r, null, 2))); }
+  if (sub === 'export') { const r = await api('GET', `/api/v1/dns/zones/${encodeURIComponent(zone)}/export`); return emit(r, () => process.stdout.write(r.text || '')); }
+  if (sub === 'import') { if (!flags.file) fail('usage: qc dns import <zone> --file zone.txt'); const r = await api('POST', `/api/v1/dns/zones/${encodeURIComponent(zone)}/import`, { text: fs.readFileSync(flags.file, 'utf8') }); return emit(r, () => say(JSON.stringify(r, null, 2))); }
+  if (sub === 'delete' || sub === 'rm-zone') { if (!flags.yes) fail(`deleting ${zone} removes every record and stops answering within seconds - re-run with --yes`); const r = await api('DELETE', `/api/v1/dns/zones/${encodeURIComponent(zone)}`, undefined, { 'Idempotency-Key': `qc-zone-del-${zone}` }); return emit(r, () => say(`deleted ${zone}.`)); }
+  fail(`unknown: dns ${sub} - try zones, add, show, set, rm, check, export, import, delete`);
+}
+
+// qc update: fetch the panel's current qc.mjs and replace THIS file in place.
+// Safety: the download must parse as a module (node --check on a temp copy)
+// and carry a VERSION line before it replaces anything; the swap is a rename
+// (atomic on the same filesystem); the old copy is kept as qc.prev next to it
+// for one command's worth of regret. A directory we can't write to gets the
+// sudo one-liner instead of a half-written binary.
+async function cmdUpdate(flags) {
+  const self = fs.realpathSync(process.argv[1]);
+  const { url } = cfg();
+  const latest = await latestVersion(true);
+  if (!latest) fail(`could not reach ${url}/api/cli/version to check for updates`);
+  if (!flags.force && !semverGt(latest, VERSION)) return say(`qc ${VERSION} is up to date (panel offers ${latest}).`);
+  let res; try { res = await fetch(url + '/api/cli/qc.mjs'); } catch (e) { fail(`download failed: ${e?.message || e}`); }
+  if (!res.ok) fail(`download failed: HTTP ${res.status}`);
+  const src = await res.text();
+  const m = src.match(/const VERSION = '([^']+)'/);
+  if (!m) fail('the download does not look like qc (no VERSION line) - not installed');
+  const tmp = path.join(path.dirname(self), `.qc.${process.pid}.tmp.mjs`);
+  try { fs.writeFileSync(tmp, src, { mode: 0o755 }); }
+  catch (e) { fail(`cannot write to ${path.dirname(self)} (${e.code}) - update by hand:\n  curl -fsSL ${url}/api/cli/qc.mjs -o qc && chmod +x qc && sudo mv qc ${self}`); }
+  const chk = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
+  if (chk.status !== 0) { try { fs.unlinkSync(tmp); } catch { /* */ } fail(`the downloaded file does not parse - not installed:\n${chk.stderr.trim().split('\n').slice(0, 3).join('\n')}`); }
+  try { fs.copyFileSync(self, self + '.prev'); fs.renameSync(tmp, self); }
+  catch (e) { try { fs.unlinkSync(tmp); } catch { /* */ } fail(`could not replace ${self} (${e.code}) - update by hand:\n  curl -fsSL ${url}/api/cli/qc.mjs -o qc && chmod +x qc && sudo mv qc ${self}`); }
+  try { fs.writeFileSync(VC_FILE, JSON.stringify({ checkedAt: Date.now(), latest: m[1] })); } catch { /* */ }
+  say(`updated qc ${VERSION} → ${m[1]} at ${self}  (previous copy kept as ${path.basename(self)}.prev)`);
+}
 function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); return v; }
 
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'job', 'reseller', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
   snap: ['list', 'create', 'rollback', 'rm'],
   backup: ['list', 'create', 'restore', 'rm'],
   preset: ['list', 'save', 'show', 'rm'],
+  dedi: ['list', 'stock', 'buy', 'show', 'reinstall', 'on', 'off', 'reboot', 'status', 'rescue', 'netboot', 'disarm', 'console', 'console-clear', 'bmc-reset', 'job', 'bandwidth', 'ips', 'storage', 'release'],
+  fw: ['list', 'sizes', 'create', 'show', 'rename', 'set', 'rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels', 'reboot', 'update', 'traffic', 'delete'],
+  lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
+  dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
 function cmdComplete(raw) {
@@ -476,6 +972,16 @@ function cmdComplete(raw) {
   else if (cmd === 'vm' && sub === 'ssh' && cur.startsWith('-')) c = ['--user'];
   else if (cmd === 'vm' && sub === 'delete' && cur.startsWith('-')) c = ['--yes'];
   else if (cmd === 'reseller' && cur.startsWith('-')) c = ['--label', '--ext-ref', '--vcpu', '--ram', '--disk', '--ips', '--yes'];
+  else if (cmd === 'dedi' && (sub === 'buy' || sub === 'reinstall') && cur.startsWith('-')) c = ['--os', '--hostname', '--nameservers', '--user', '--password', '--ssh-key', '--ssh-key-file', '--root-ssh', '--fs', '--boot', '--no-boot', '--yes'];
+  else if (cmd === 'dedi' && sub === 'ips' && cword === 3) c = ['list', 'add', 'rm', 'primary'];
+  else if (cmd === 'dedi' && sub === 'storage' && cword === 3) c = ['show', 'discover', 'apply', 'boot-vd'];
+  else if (cmd === 'dedi' && cur.startsWith('-')) c = ['--yes', '--wait', '--mode', '--hours', '--address', '--pay-cleanup-fee', '--file'];
+  else if (cmd === 'dns' && cur.startsWith('-')) c = ['--ttl', '--file', '--yes'];
+  else if (cmd === 'fw' && sub === 'create' && cur.startsWith('-')) c = ['--label', '--size', '--ha', '--ips', '--lan', '--no-dhcp', '--subnet', '--address', '--port', '--yes'];
+  else if (cmd === 'fw' && ['rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels'].includes(sub) && cword === 3) c = ['list', 'add', 'rm'];
+  else if (cmd === 'lb' && sub === 'listeners' && cur.startsWith('-')) c = ['--http', '--tcp', '--port', '--algorithm', '--sticky', '--proxy-protocol', '--hc-path', '--hc-status', '--hc-interval', '--tls', '--redirect', '--backend-port', '--yes'];
+  else if (cmd === 'lb' && cur.startsWith('-')) c = ['--label', '--ip', '--port', '--weight', '--yes'];
+  else if (cmd === 'fw' && cur.startsWith('-')) c = ['--port', '--proto', '--from', '--to', '--block', '--label', '--wan-ip', '--lan', '--cidr', '--address', '--out', '--remote', '--lans', '--endpoint', '--range', '--yes'];
   process.stdout.write(c.filter((x) => x.startsWith(cur)).join('\n') + '\n');
 }
 function cmdCompletion(pos) {
@@ -532,11 +1038,62 @@ Usage: qc <command> [args] [--json]
   preset show <name>                print its content
   preset rm <name> --yes            delete it
 
+  dedi list                         your dedicated servers
+  dedi stock                        bare metal for sale by the hour
+  dedi buy <stock-id> [--os <tpl> --hostname h --user u --password p|--ssh-key "<pub>"] --yes
+                                    charges the minimum rental now; --os installs straight away
+  dedi show <id>                    hardware, power, IPs, armed boot, RAID
+  dedi reinstall <id> --os <tpl> [--hostname h] [--user u --password p|--ssh-key-file p]
+                 [--root-ssh] [--fs ext4|xfs] [--boot] --yes     WIPES the server
+  dedi on|off|reboot|status <id> [--wait]   chassis power via the management controller
+  dedi rescue|netboot <id> --yes    boot SystemRescue / the netboot.xyz menu
+  dedi disarm <id>                  cancel an armed PXE boot
+  dedi console <id> [--mode sol|vnc]        mint a console session (open in the panel)
+  dedi job <id> <job-id> [--wait]   poll a hardware job
+  dedi ips <id> list|add [--address a]|rm <ip-id> --yes|primary <ip-id>
+  dedi storage <id> show|discover|apply --file plan.json --yes|boot-vd <fqdd>
+  dedi bandwidth <id> [--hours n]
+  dedi release <id> --yes           hand an hourly server back (wiped, billing stops)
+
+  fw list | sizes                   your Cloud Firewalls / sizes + prices
+  fw create --label <n> [--size small|medium|large] [--ha] [--ips n] [--lan <cidr>] --yes
+  fw show <id>                      addresses, networks, rules, forwards, NAT, VPN, tunnels
+  fw rules <id> list|add --port 443 [--proto tcp|udp] [--from <cidr>] [--block]|rm <rid>|enable|disable
+  fw forwards <id> list|add --port <public> --to <lan-ip>[:port]|rm <fid>
+  fw vpn <id> list|add <user>|profile <uid> --out u.ovpn|regenerate <uid>|rm <uid>
+  fw lans <id> list|add --cidr <c>|attach <lid> <vm-id>|detach <lid> <vm-id>|private-only <lid> <vm-id> --yes|rm <lid> --yes
+  fw wan <id> list|add|rm <ip-id> --yes        extra public addresses
+  fw nat1 <id> list|add --to <lan-ip> [--wan-ip <ip>|new]|rm <nid>
+  fw tunnels <id> list|add --label HQ --remote <cidr>|config <tid> --out f|rm <tid> --yes
+  fw reboot|update <id> --yes
+  fw delete <id> --yes
+
+  lb list | info                    your load balancers / price, limits, port range, fleet
+  lb create --label <n> --yes       a hostname on the shared fleet, billed hourly
+  lb show <id>                      listeners, backends + health, domains, certificates
+  lb listeners <id> add --http [--tls managed] [--redirect] [--algorithm a] [--sticky] [--hc-path p]
+  lb listeners <id> add --tcp --port <n>    |  set <lid> …  |  rm <lid> --yes
+  lb backends <id> <lid> add --ip <your-ip> [--port n] [--weight n] | drain|undrain|rm <bid>
+  lb domains <id> add <domain> | verify <did> | rm <did>
+  lb delete <id> --yes
+
+  dns zones                         your hosted zones + our nameservers
+  dns add <domain>                  add a zone
+  dns show <zone>                   all record sets (zone by id or name)
+  dns set <zone> <name|@> <TYPE> <value…> [--ttl n]   create/replace a record set
+  dns rm <zone> <name:TYPE|id>      delete a record set ('@:TXT' = apex)
+  dns check <zone>                  is the domain delegated to us?
+  dns export <zone>                 BIND zone file to stdout
+  dns import <zone> --file <path>   import a BIND zone file
+  dns delete <zone> --yes           delete the zone
+
   job get <id>                      check an async job
   job wait <id>                     block until a job finishes
 
   reseller customers list|create|show|suspend|resume|delete|sso …   (reseller keys)
 
+  update                            download the panel's current qc and replace this one
+  version [--check]                 this version (--check: ask the panel for the latest now)
   completion bash|zsh               print a shell tab-completion script
 
 Add --json to any command for machine-readable output.
@@ -553,7 +1110,12 @@ const cmd = (pos.shift() || 'help').toLowerCase();
 (async () => {
   switch (cmd) {
     case 'help': case '-h': case '--help': return help();
-    case 'version': case '-v': case '--version': return say(`qc ${VERSION}`);
+    case 'version': case '-v': case '--version': {
+      say(`qc ${VERSION}`);
+      if (flags.check) { const latest = await latestVersion(true); say(latest ? (semverGt(latest, VERSION) ? `latest: ${latest} - run:  qc update` : `latest: ${latest} - up to date`) : 'could not reach the panel to check'); }
+      return;
+    }
+    case 'update': case 'self-update': return cmdUpdate(flags);
     case 'completion': return cmdCompletion(pos);
     case 'config': return cmdConfig(pos, flags);
     case 'whoami': case 'workspace': return cmdWhoami();
@@ -563,10 +1125,14 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'snap': case 'snapshot': return cmdSnap(pos, flags);
     case 'backup': return cmdBackup(pos, flags);
     case 'preset': case 'presets': return cmdPreset(pos, flags);
+    case 'dedi': case 'dedicated': return cmdDedi(pos, flags);
+    case 'fw': case 'firewall': return cmdFw(pos, flags);
+    case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
+    case 'dns': return cmdDns(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
     default: fail(`unknown command: ${cmd} (try: qc help)`);
   }
 })()
-  .then(() => { if (cmd !== 'completion') return maybeNotifyUpdate(); })
+  .then(() => { if (!['completion', 'update', 'version', '-v', '--version'].includes(cmd)) return maybeNotifyUpdate(); })
   .catch((e) => fail(e?.message || String(e)));
