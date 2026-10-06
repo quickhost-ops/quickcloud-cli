@@ -1,7 +1,7 @@
 # quickcloud-cli (`qc`)
 
 A tiny, **zero-dependency** command-line tool for the QuickHost QuickCloud API
-(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes, managed databases and DNS straight from your shell —
+(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes, managed databases, SMTP relay and DNS straight from your shell —
 scriptable, pipeable, automatable.
 
 > **Read before you run.** `qc` is a single, self-contained file. It has no
@@ -249,6 +249,21 @@ qc db delete 5 --yes                          # backups kept for the grace perio
 
 Private instead of public: `--network <id>` (one of your private networks with a
 router) replaces `--allow`. `--ha` builds a three-node cluster (where offered).
+
+**SMTP relay** (QuickSMTP - one sender login per application, DKIM-signed
+sending domains, a searchable delivery log; subscribe and change plans in the panel):
+
+```sh
+qc relay status
+qc relay senders add --label shop-prod        # SMTP username + password printed ONCE
+qc relay senders pause 5                      # stop a compromised app sending; resume later
+qc relay domains add example.com              # prints the DKIM TXT record to publish
+qc relay log --q alice@example.net            # what happened to a message
+qc relay log --csv --out deliveries.csv
+```
+
+A key can be limited to one sender: it can pause/resume that sender and read its
+log, nothing else - ideal for the app that owns the credentials.
 
 **Hosted DNS** (zones by id or name; record sets are whole-set upserts):
 

@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.6.0';   // 1.6.0: managed databases (qc db …); 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.7.0';   // 1.7.0: SMTP relay (qc relay …); 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -1069,6 +1069,48 @@ async function cmdDb(pos, flags) {
   fail(`unknown: db ${sub} - try list, sizes, create, show, rename, admin-password, start|stop|shutdown|reboot, switchover, logs, recovery, alerts, ca, users, databases, adopt, set, allow, backup, restore, recover, delete`);
 }
 
+// --- SMTP relay (QuickSMTP) ---------------------------------------------------
+// Day-2 only: senders, DKIM domains, the delivery log. Subscribing / plan
+// changes are done in the panel (money + reseller ledger).
+async function cmdRelay(pos, flags) {
+  const sub = (pos.shift() || 'status').toLowerCase();
+  if (sub === 'status' || sub === 'show' || sub === 'overview') {
+    const r = await api('GET', '/api/v1/relay');
+    return emit(r, () => {
+      const su = r.subscription;
+      if (!su) { say(`no SMTP relay subscription - subscribe in the panel (plans: ${(r.plans || []).map((p) => `${p.slug} ${p.emails_mo}/mo ${money(p.price_gbp)}`).join(', ') || '—'}).`); return; }
+      say(`plan     : ${su.plan_name} (${su.plan_slug})  ${money(su.price_gbp)}/mo  [${su.status}${su.blocked ? ` - BLOCKED: ${su.block_reason}` : ''}]${su.cancel_at_period_end ? '  cancels at period end' : ''}${su.pending_plan_slug ? `  → ${su.pending_plan_slug} at renewal` : ''}`);
+      say(`quota    : ${su.period_accepted}/${su.emails_mo} this billing period · resets ${String(su.period_end || '').slice(0, 10)}`);
+      if (r.usage) say(`delivered: ${r.usage.delivered}  bounced ${r.usage.bounced}  accepted ${r.usage.accepted}`);
+      say(`smtp     : ${r.smtp_host}  (STARTTLS, port 587 - log in with a sender username + its secret)`);
+      say(`senders  : ${(r.senders || []).length ? r.senders.map((x) => `${x.username} [#${x.id} ${x.status}${x.paused_reason ? ': ' + x.paused_reason : ''}]`).join(', ') : 'none -  qc relay senders add --label app'}`);
+      say(`domains  : ${(r.domains || []).length ? r.domains.map((d) => `${d.domain} [#${d.id} ${d.status}]`).join(', ') : 'none -  qc relay domains add example.com'}`);
+    });
+  }
+  if (sub === 'senders' || sub === 'sender') {
+    const act = (pos[0] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', '/api/v1/relay'); return emit({ senders: r.senders || [] }, () => ((r.senders || []).length ? table(['ID', 'USERNAME', 'STATUS', 'REASON', 'LAST USED'], r.senders.map((x) => [x.id, x.username, x.status, x.paused_reason || '', x.last_used_at || 'never'])) : say('no senders.'))); }
+    if (act === 'add' || act === 'create') { if (!flags.label) fail('usage: qc relay senders add --label <what it is for>   (becomes part of the SMTP username)'); const r = await api('POST', '/api/v1/relay/senders', { label: flags.label }, idemKey('relay-sender')); return emit(r, () => { say(`sender #${r.sender?.id} created`); say(`smtp host : ${r.smtp_host}  (port 587, STARTTLS)`); say(`username  : ${r.sender?.username}`); say(`password  : ${r.secret}   (shown ONCE - only a hash is kept)`); }); }
+    const id = need(pos[1], `qc relay senders ${act} <sender-id>`);
+    if (['pause', 'resume', 'revoke'].includes(act)) { if (act === 'revoke' && !flags.yes) fail('revoking is permanent (create a new sender afterwards) - re-run with --yes'); const r = await api('POST', `/api/v1/relay/senders/${id}/status`, { status: act === 'pause' ? 'paused' : act === 'resume' ? 'active' : 'revoked', reason: flags.reason }); return emit(r, () => say(`sender ${r.sender?.username} is now ${r.sender?.status}.`)); }
+    fail('usage: qc relay senders list|add --label l|pause <id>|resume <id>|revoke <id> --yes');
+  }
+  if (sub === 'domains' || sub === 'domain') {
+    const act = (pos[0] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', '/api/v1/relay'); return emit({ domains: r.domains || [] }, () => ((r.domains || []).length ? r.domains.forEach((d) => { say(`#${d.id}  ${d.domain}  [${d.status}]`); say(`  TXT  ${d.dns_name}`); say(`       ${d.dns_value}`); }) : say('no sending domains.'))); }
+    if (act === 'add') { const domain = need(pos[1], 'qc relay domains add <domain>'); const r = await api('POST', '/api/v1/relay/domains', { domain }, idemKey('relay-domain')); return emit(r, () => { const d = r.domain || {}; say(`domain ${d.domain} added - publish this DNS record so mail gets DKIM-signed:`); say(`  TXT  ${d.dns_name}`); say(`       ${d.dns_value}`); if (d.domain) say(`  (hosted here?  qc dns set ${d.domain} ${String(d.dns_name).replace('.' + d.domain, '')} TXT '${d.dns_value}')`); }); }
+    if (act === 'rm' || act === 'delete') { const id = need(pos[1], 'qc relay domains rm <domain-id> --yes'); if (!flags.yes) fail('re-run with --yes to remove the domain (mail from it stops being signed)'); const r = await api('DELETE', `/api/v1/relay/domains/${id}`); return emit(r, () => say('domain removed.')); }
+    fail('usage: qc relay domains list|add <domain>|rm <id> --yes');
+  }
+  if (sub === 'log' || sub === 'events') {
+    if (flags.csv) { const text = await apiText(`/api/v1/relay/events.csv${flags.q ? `?q=${encodeURIComponent(flags.q)}` : ''}`); const out = flags.out || 'quicksmtp-delivery-log.csv'; fs.writeFileSync(out, text); return say(`delivery log saved to ${out}`); }
+    const qs = new URLSearchParams(); if (flags.q) qs.set('q', flags.q); if (flags.sender) qs.set('sender_id', flags.sender); if (flags.limit) qs.set('limit', flags.limit);
+    const r = await api('GET', `/api/v1/relay/events${qs.toString() ? '?' + qs : ''}`); const ev = r.events || [];
+    return emit(r, () => (ev.length ? table(['TIME', 'EVENT', 'SENDER', 'FROM', 'TO', 'SUBJECT', 'CODE', 'REASON'], ev.map((e) => [e.at || e.created_at || '', e.event, e.username || e.sender_id, e.from_addr || '', e.rcpt || '', (e.subject || '').slice(0, 40), e.smtp_code ?? '', (e.reason || '').slice(0, 50)])) : say('no delivery events yet.')));
+  }
+  fail(`unknown: relay ${sub} - try status, senders, domains, log`);
+}
+
 // --- hosted DNS ---------------------------------------------------------------
 // Zones by id or name; record sets are whole-set upserts (Route-53 style), so
 // `qc dns set example.com www A 203.0.113.10 203.0.113.11` replaces the set.
@@ -1131,7 +1173,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1143,6 +1185,7 @@ const COMPLETE_SUB = {
   lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
+  relay: ['status', 'senders', 'domains', 'log'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
@@ -1182,6 +1225,7 @@ function cmdComplete(raw) {
   else if (cmd === 'fw' && ['rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels'].includes(sub) && cword === 3) c = ['list', 'add', 'rm'];
   else if (cmd === 'lb' && sub === 'listeners' && cur.startsWith('-')) c = ['--http', '--tcp', '--port', '--algorithm', '--sticky', '--proxy-protocol', '--hc-path', '--hc-status', '--hc-interval', '--tls', '--redirect', '--backend-port', '--yes'];
   else if (cmd === 'lb' && cur.startsWith('-')) c = ['--label', '--ip', '--port', '--weight', '--yes'];
+  else if (cmd === 'relay' && cur.startsWith('-')) c = ['--label', '--reason', '--q', '--sender', '--limit', '--csv', '--out', '--yes'];
   else if (cmd === 'db' && cur.startsWith('-')) c = ['--label', '--engine', '--size', '--version', '--allow', '--network', '--address', '--database', '--ha', '--password', '--access', '--owner', '--extensions', '--at', '--set', '--target', '--out', '--node', '--request', '--yes'];
   else if (cmd === 'box' && cur.startsWith('-')) c = ['--metered', '--cap', '--plan', '--label', '--keep', '--none', '--yes'];
   else if (cmd === 'fw' && cur.startsWith('-')) c = ['--port', '--proto', '--from', '--to', '--block', '--label', '--wan-ip', '--lan', '--cidr', '--address', '--out', '--remote', '--lans', '--endpoint', '--range', '--yes'];
@@ -1306,6 +1350,11 @@ Usage: qc <command> [args] [--json]
   db logs <id> [--request] | db ca <id> --out ca.pem | db alerts <id> on|off
   db delete <id> --yes
 
+  relay status                      SMTP relay subscription, quota, senders, domains
+  relay senders list|add --label l|pause <id>|resume <id>|revoke <id> --yes   (password shown once)
+  relay domains list|add <domain>|rm <id> --yes       DKIM: prints the TXT record to publish
+  relay log [--q text] [--sender id] [--limit n] [--csv --out file]   delivery log
+
   dns zones                         your hosted zones + our nameservers
   dns add <domain>                  add a zone
   dns show <zone>                   all record sets (zone by id or name)
@@ -1359,6 +1408,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
     case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
     case 'db': case 'database': case 'databases': return cmdDb(pos, flags);
+    case 'relay': case 'smtp': return cmdRelay(pos, flags);
     case 'dns': return cmdDns(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
