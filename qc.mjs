@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.5.0';   // 1.5.0: storage boxes (qc box …); 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated servers + hosted DNS
+const VERSION = '1.6.0';   // 1.6.0: managed databases (qc db …); 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -944,6 +944,131 @@ async function cmdBox(pos, flags) {
   fail(`unknown: box ${sub} - try list, plans, create, show, password, resize, mode, snap, allow, keys, delete`);
 }
 
+// --- managed databases ----------------------------------------------------------
+// PostgreSQL / MariaDB / Valkey instances on dedicated resources (optionally a
+// 3-node HA cluster). Creating builds VMs that bill hourly from the moment they
+// exist, so create / restore are --yes gated and idempotent. Passwords are shown
+// once; there is no shell or console - that is the product.
+async function cmdDb(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/databases'); const dbs = r.databases || [];
+    return emit(r, () => (dbs.length ? table(['ID', 'LABEL', 'ENGINE', 'SIZE', 'HA', 'STATUS', 'HOST', 'PORT', '£/MO MAX'], dbs.map((d) => [d.id, d.label, `${d.engine} ${d.version || ''}`, d.size?.slug || d.size || '—', d.ha ? `${d.cluster?.state || 'yes'}` : '', d.status, d.connect?.host || d.address || '—', d.port, money(d.cost?.all_in?.monthly_max)])) : say('no database instances.  Create one:  qc db create --label app --engine postgres --size s --allow <your-ip>/32 --yes   (see  qc db sizes)')));
+  }
+  if (sub === 'sizes' || sub === 'engines' || sub === 'info') {
+    const r = await api('GET', '/api/v1/databases');
+    return emit(r, () => {
+      say(`engines : ${Object.entries(r.engines || {}).map(([k, e]) => `${k} (${e.label}${e.versions ? ' ' + e.versions.join('/') : ''})`).join(', ') || '—'}`);
+      table(['SIZE', 'CPU', 'MEMORY', 'DATA', '£/MO MAX (ALL-IN)', 'HA CLUSTER £/MO'], (r.sizes || []).map((z) => [z.slug, z.vcpu, gb(z.ram_mb), `${z.disk_gb}G`, money(z.total?.monthly_max), z.total_ha ? money(z.total_ha.monthly_max) : (r.ha?.offered ? '—' : 'not offered')]));
+      say(`\nall-in = management + dedicated CPU/memory + system and data disks, billed hourly; backups metered on top. PITR ${r.pitr_days ?? '—'} days.`);
+      say(`access  : public (own IPv4, TLS required, access list REQUIRED) or private (one of your networks with a router: ${(r.networks || []).filter((n) => n.usable).map((n) => `#${n.id} ${n.label} ${n.cidr}`).join(', ') || 'none usable yet'})`);
+      if (r.your_ip) say(`your ip : ${r.your_ip}  (a sensible first --allow entry)`);
+      if (r.ready === false) say('NOT READY - the platform is not fully configured; creation is refused for now.');
+    });
+  }
+  if (sub === 'create' || sub === 'new') {
+    if (!flags.label || !flags.engine) fail('usage: qc db create --label <n> --engine postgres|mariadb|valkey [--size s|m|l] [--version v] (--allow <cidr>[,…] | --network <id> [--address <ip>]) [--database <name>] [--ha] --yes');
+    if (!flags.yes) fail('a database instance builds dedicated servers that bill hourly from now - re-run with --yes' + (flags.ha ? ' (an HA cluster builds THREE)' : ''));
+    const body = { label: flags.label, engine: flags.engine, size: flags.size || 's' };
+    if (flags.version) body.version = String(flags.version);
+    if (flags.network) { body.listen_mode = 'private'; body.network_id = +flags.network; if (flags.address) body.address = flags.address; }
+    else { body.listen_mode = 'public'; if (!flags.allow) fail('a public instance needs an access list: --allow <cidr>[,<cidr>…] (or use --network <id> for a private one)'); body.allowlist = String(flags.allow).split(',').map((x) => x.trim()).filter(Boolean); }
+    if (flags.database) body.database = flags.database;
+    if (flags.ha) body.ha = true;
+    const r = await api('POST', '/api/v1/databases', body, idemKey('db-create'));
+    return emit(r, () => {
+      const d = r.database || {};
+      say(`database #${d.id} (${d.label}) is building${d.ha ? ' as a 3-node HA cluster' : ''} - job ${r.jobId}.  Est. ${money(d.cost?.all_in?.monthly_max)}/mo max.`);
+      say(`host     : ${d.connect?.host || d.address || '(pending)'}:${d.port || ''}`);
+      say(`admin    : ${d.connect?.user || 'qcadmin'}`);
+      if (r.admin_password) { say(`password : ${r.admin_password}`); say('  (shown ONCE - store it now; later:  qc db admin-password <id> rotate)'); }
+      say(`ca cert  : qc db ca ${d.id} --out ca.pem   (once the instance is active)`);
+      say(`watch    : qc db show ${d.id}`);
+    });
+  }
+  const id = need(pos[0], `qc db ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/databases/${id}`); const d = r.database || {};
+    return emit(r, () => {
+      say(`#${d.id}  ${d.label}  ${d.engine} ${d.version || ''}  [${d.status}]${d.ha ? `  HA cluster: ${d.cluster?.state || '?'}${d.cluster?.leader_idx != null ? `, leader node ${d.cluster.leader_idx}` : ''}` : ''}`);
+      if (d.build && d.build.length) for (const b of d.build) say(`building : node ${b.idx ?? 0} - ${b.text || b.phase || ''}`);
+      say(`connect  : ${d.connect?.host || '—'}:${d.port}  user ${d.connect?.user || '—'}  tls ${d.connect?.tls || 'required'}  (${d.listen_mode}${d.address ? ' ' + d.address : ''})`);
+      say(`size     : ${d.size?.slug || ''} ${d.size?.vcpu ? `${d.size.vcpu} CPU · ${gb(d.size.ram_mb)} · ${d.size.disk_gb}G data` : ''}   cost ${money(d.cost?.all_in?.monthly_max)}/mo max`);
+      if (d.usage) say(`usage    : disk ${d.usage.disk_pct ?? '—'}%  memory ${d.usage.mem_pct ?? d.usage.memory_pct ?? '—'}%  connections ${d.usage.connections ?? '—'}${d.usage.max_connections ? '/' + d.usage.max_connections : ''}`);
+      if ((d.users || []).length) { say('users    :'); table(['  ID', 'NAME', 'ACCESS/GRANTS'], d.users.map((u) => ['  ' + u.id, u.name, u.access || (u.grants || []).map((g) => `${g.database || g.database_id}:${g.role}`).join(', ') || '—'])); }
+      if ((d.databases || []).length) { say('databases:'); table(['  ID', 'NAME', 'STATUS', 'OWNER', 'EXTENSIONS', 'SIZE'], d.databases.map((x) => ['  ' + x.id, x.name, x.status, x.owner || x.owner_user_id || '—', (x.extensions || []).join(',') || '—', x.stats?.size_gb != null ? `${x.stats.size_gb}G` : '—'])); }
+      if ((d.unmanaged || []).length) say(`unmanaged: ${d.unmanaged.map((u) => u.name).join(', ')}  (created over SQL - adopt with  qc db adopt ${d.id} <name>)`);
+      say(`access   : ${(d.allowlist || []).length ? d.allowlist.map((a) => `${a.cidr}${a.label ? ' ' + a.label : ''} [#${a.id}]`).join(', ') : (d.listen_mode === 'private' ? 'the private network' : 'none')}`);
+      if (d.backup) say(`backups  : ${d.backup.enabled ? (d.backup.pitr ? `nightly + point-in-time${d.backup.window?.from ? ` (window ${d.backup.window.from} → ${d.backup.window.to})` : ''}` : 'nightly snapshots') : 'not configured'}${d.backup.last ? `  last ${d.backup.last.ts} ${d.backup.last.ok ? 'ok' : 'FAILED'}` : ''}`);
+      if (d.restore) say(`restore  : ${d.restore.state}${d.restore.from ? ` from #${d.restore.from}` : ''}${d.restore.at ? ` @ ${d.restore.at}` : ''}${d.restore.error ? ` - ${d.restore.error}` : ''}`);
+      if (d.recover) say(`recover  : ${d.recover.state} ${d.recover.database || ''} → ${d.recover.target || ''}${d.recover.error ? ` - ${d.recover.error}` : ''}`);
+    });
+  }
+  if (sub === 'rename') { const label = need(pos[1], 'qc db rename <id> <label>'); const r = await api('PATCH', `/api/v1/databases/${id}`, { label }); return emit(r, () => say(`renamed to ${r.database?.label}.`)); }
+  if (sub === 'admin-password' || sub === 'admin') {
+    const act = (pos[1] || 'reveal').toLowerCase();
+    if (act === 'rotate') { if (!flags.yes) fail('rotating replaces the admin password everywhere - re-run with --yes'); const r = await api('POST', `/api/v1/databases/${id}/admin-password/rotate`, {}); return emit(r, () => say(`admin user ${r.user}  new password: ${r.password}   (shown ONCE)`)); }
+    const r = await api('POST', `/api/v1/databases/${id}/admin-password`, {}); return emit(r, () => say(`admin ${r.user}@${r.host}:${r.port}  password: ${r.password}   (shown ONCE - it is scrubbed now)`));
+  }
+  if (['start', 'stop', 'shutdown', 'reboot'].includes(sub)) { if (!flags.yes && sub !== 'start') fail(`re-run with --yes to ${sub} the instance`); const r = await api('POST', `/api/v1/databases/${id}/power`, { action: sub }); return emit(r, () => say(`${sub} queued (job ${r.jobId || '?'}).`)); }
+  if (sub === 'switchover') { const idx = need(pos[1], 'qc db switchover <id> <node-idx> --yes'); if (!flags.yes) fail('a switchover moves the endpoint to another node (brief reconnects) - re-run with --yes'); const r = await api('POST', `/api/v1/databases/${id}/switchover`, { idx: +idx }); return emit(r, () => say(`switchover to node ${idx} requested - the cluster moves on its next heartbeat.`)); }
+  if (sub === 'logs' || sub === 'log') {
+    if (flags.request || flags.refresh) { const r = await api('POST', `/api/v1/databases/${id}/logs`, flags.node != null ? { idx: +flags.node } : {}); return emit(r, () => say('log requested - the instance answers on its next heartbeat; run  qc db logs ' + id + '  in ~30s.')); }
+    const r = await api('GET', `/api/v1/databases/${id}/logs${flags.node != null ? `?idx=${+flags.node}` : ''}`); return emit(r, () => { if (r.pending) say('(a request is outstanding)'); say(r.tail || r.log || '(no log yet - request one with  --request)'); });
+  }
+  if (sub === 'recovery') { const on = (pos[1] || '').toLowerCase(); if (!['on', 'off'].includes(on)) fail('usage: qc db recovery <id> on|off   (MariaDB single instance: read-only recovery mode)'); const r = await api('POST', `/api/v1/databases/${id}/recovery`, { on: on === 'on' }); return emit(r, () => say(`recovery mode ${on}.`)); }
+  if (sub === 'alerts') { const on = (pos[1] || '').toLowerCase(); if (!['on', 'off'].includes(on)) fail('usage: qc db alerts <id> on|off'); const r = await api('PATCH', `/api/v1/databases/${id}/alerts`, { alerts: on === 'on' }); return emit(r, () => say(`HA event emails ${on}.`)); }
+  if (sub === 'ca' || sub === 'ca-cert') { const out = flags.out || `db-${id}-ca.pem`; const text = await apiText(`/api/v1/databases/${id}/ca.pem`); fs.writeFileSync(out, text); return say(`CA certificate saved to ${out}  (e.g. psql "sslmode=verify-full sslrootcert=${out} …")`); }
+  if (sub === 'users' || sub === 'user') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/databases/${id}`); return emit({ users: r.database?.users || [] }, () => table(['ID', 'NAME', 'ACCESS/GRANTS'], (r.database?.users || []).map((u) => [u.id, u.name, u.access || (u.grants || []).map((g) => `${g.database || g.database_id}:${g.role}`).join(', ') || '—']))); }
+    if (act === 'add') { const name = need(pos[2], 'qc db users <id> add <name> [--password p] [--access full|readwrite|readonly (valkey)]'); const body = { name }; if (flags.password) body.password = flags.password; if (flags.access) body.access = flags.access; const r = await api('POST', `/api/v1/databases/${id}/users`, body); return emit(r, () => say(`user ${r.user?.name} (#${r.user?.id}) added  password: ${r.password}   (shown ONCE)`)); }
+    const uid = need(pos[2], `qc db users <id> ${act} <user-id>`);
+    if (act === 'rm' || act === 'delete') { if (!flags.yes) fail('re-run with --yes to remove the user'); const r = await api('DELETE', `/api/v1/databases/${id}/users/${uid}`); return emit(r, () => say('user removed.')); }
+    if (act === 'password' || act === 'rotate') { const r = await api('POST', `/api/v1/databases/${id}/users/${uid}/password`, flags.password ? { password: flags.password } : {}); return emit(r, () => say(`user ${r.user?.name}: new password ${r.password}   (shown ONCE)`)); }
+    if (act === 'grant') { const dbRef = need(pos[3], 'qc db users <id> grant <user-id> <database-id> owner|readwrite|readonly|none'); const role = need(pos[4], 'qc db users <id> grant <user-id> <database-id> owner|readwrite|readonly|none'); const r = await api('PUT', `/api/v1/databases/${id}/users/${uid}/grants`, { database_id: +dbRef, role: role === 'none' ? null : role }); return emit(r, () => say(role === 'none' ? 'grant removed.' : `granted ${role}.`)); }
+    if (act === 'access') { const access = need(pos[3], 'qc db users <id> access <user-id> full|readwrite|readonly'); const r = await api('PUT', `/api/v1/databases/${id}/users/${uid}/access`, { access }); return emit(r, () => say(`access set to ${access}.`)); }
+    fail('usage: qc db users <id> list|add <name>|rm <uid> --yes|password <uid> [--password p]|grant <uid> <db-id> <role>|access <uid> <level>');
+  }
+  if (sub === 'databases' || sub === 'dbs') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/databases/${id}`); return emit({ databases: r.database?.databases || [] }, () => table(['ID', 'NAME', 'STATUS', 'OWNER', 'EXTENSIONS'], (r.database?.databases || []).map((x) => [x.id, x.name, x.status, x.owner || x.owner_user_id || '—', (x.extensions || []).join(',') || '—']))); }
+    if (act === 'add' || act === 'create') { const name = need(pos[2], 'qc db databases <id> add <name> [--owner <user-id>] [--extensions a,b]'); const body = { name }; if (flags.owner) body.owner_user_id = +flags.owner; if (flags.extensions) body.extensions = String(flags.extensions).split(','); const r = await api('POST', `/api/v1/databases/${id}/databases`, body); return emit(r, () => say(`database ${r.database?.name} (#${r.database?.id}) queued.`)); }
+    const did = need(pos[2], `qc db databases <id> ${act} <database-id>`);
+    if (act === 'drop' || act === 'rm') { if (!flags.yes) fail(`DROP destroys database ${did}'s data - re-run with --yes`); const r = await api('DELETE', `/api/v1/databases/${id}/databases/${did}`); return emit(r, () => say('drop queued (destroy-list: the name stays reserved until the instance confirms).')); }
+    if (act === 'extensions') { const ext = pos.slice(3).join(',').split(',').map((x) => x.trim()).filter(Boolean); const r = await api('PUT', `/api/v1/databases/${id}/databases/${did}/extensions`, { extensions: ext }); return emit(r, () => say(`extensions: ${(r.database?.extensions || []).join(', ') || 'none'}.`)); }
+    fail('usage: qc db databases <id> list|add <name>|drop <did> --yes|extensions <did> <ext…>');
+  }
+  if (sub === 'adopt') { const name = need(pos[1], 'qc db adopt <id> <name>'); const r = await api('POST', `/api/v1/databases/${id}/databases/adopt`, { name }); return emit(r, () => say(`adopted ${r.database?.name} (#${r.database?.id}).`)); }
+  if (sub === 'settings' || sub === 'set') {
+    if (pos.length < 2 && !Object.keys(flags).some((k) => k !== 'json')) { const r = await api('GET', `/api/v1/databases/${id}`); return emit({ settings: r.database?.settings, setting_specs: r.database?.setting_specs }, () => { say(JSON.stringify(r.database?.settings || {}, null, 2)); say('\nsettable keys: ' + Object.keys(r.database?.setting_specs || {}).join(', ')); }); }
+    // qc db set <id> key=value [key=value…]
+    const body = {}; for (const kv of pos.slice(1)) { const [k, ...v] = kv.split('='); if (k && v.length) body[k] = v.join('='); }
+    if (!Object.keys(body).length) fail('usage: qc db set <id> key=value [key=value…]   (qc db set <id>  alone lists current settings + keys)');
+    const r = await api('PUT', `/api/v1/databases/${id}/settings`, body); return emit(r, () => say('settings applied: ' + JSON.stringify(r.settings || r)));
+  }
+  if (sub === 'allow' || sub === 'allowlist') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/databases/${id}`); return emit({ allowlist: r.database?.allowlist || [] }, () => table(['ID', 'CIDR', 'LABEL'], (r.database?.allowlist || []).map((a) => [a.id, a.cidr, a.label || '']))); }
+    if (act === 'add') { const cidr = need(pos[2], 'qc db allow <id> add <cidr> [--label l]'); const r = await api('POST', `/api/v1/databases/${id}/allowlist`, { cidr, label: flags.label }); return emit(r, () => say(`allowed ${r.entry?.cidr} [#${r.entry?.id}].`)); }
+    if (act === 'rm' || act === 'delete') { const aid = need(pos[2], 'qc db allow <id> rm <entry-id>'); const r = await api('DELETE', `/api/v1/databases/${id}/allowlist/${aid}`); return emit(r, () => say('entry removed.')); }
+    fail('usage: qc db allow <id> list|add <cidr> [--label l]|rm <entry-id>');
+  }
+  if (sub === 'backup') { const r = await api('POST', `/api/v1/databases/${id}/backup`, {}); return emit(r, () => say('full backup requested (the instance takes it on its next heartbeat).')); }
+  if (sub === 'restore') {
+    if (!flags.at && !flags.set) fail('usage: qc db restore <id> --at 2026-10-06T08:30:00Z [--label l] [--size s] [--allow <cidr,…> | --network <id> [--address ip]] --yes   (Valkey: --set <timestamp>)');
+    if (!flags.yes) fail('restore builds a NEW instance that bills from now - re-run with --yes');
+    const body = {}; if (flags.at) body.at = flags.at; if (flags.set) body.set = flags.set; if (flags.label) body.label = flags.label; if (flags.size) body.size = flags.size;
+    if (flags.network) { body.listen_mode = 'private'; body.network_id = +flags.network; if (flags.address) body.address = flags.address; }
+    else if (flags.allow) { body.listen_mode = 'public'; body.allowlist = String(flags.allow).split(',').map((x) => x.trim()).filter(Boolean); }
+    const r = await api('POST', `/api/v1/databases/${id}/restore`, body, idemKey('db-restore'));
+    return emit(r, () => say(`restoring into NEW instance #${r.database?.id} (${r.database?.label}) - job ${r.jobId || '?'}.  Watch:  qc db show ${r.database?.id}`));
+  }
+  if (sub === 'recover') { const database = need(pos[1], 'qc db recover <id> <database-name> --at <utc> [--target <new-name>]'); if (!flags.at) fail('--at <UTC moment> is required'); const r = await api('POST', `/api/v1/databases/${id}/recover`, { database, at: flags.at, target: flags.target }); return emit(r, () => say(`recovering ${database} as ${r.database?.recover?.target || flags.target || '(auto name)'} - watch  qc db show ${id}`)); }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail(`deleting instance ${id} destroys its server(s); backups are kept for the grace period. Re-run with --yes`); const r = await api('DELETE', `/api/v1/databases/${id}`, undefined, idemKey('db-delete')); return emit(r, () => say(`database instance ${id} is being deleted.${r.backup_purge_at ? `  Backups kept until ${r.backup_purge_at} (restorable to a new instance).` : ''}`)); }
+  fail(`unknown: db ${sub} - try list, sizes, create, show, rename, admin-password, start|stop|shutdown|reboot, switchover, logs, recovery, alerts, ca, users, databases, adopt, set, allow, backup, restore, recover, delete`);
+}
+
 // --- hosted DNS ---------------------------------------------------------------
 // Zones by id or name; record sets are whole-set upserts (Route-53 style), so
 // `qc dns set example.com www A 203.0.113.10 203.0.113.11` replaces the set.
@@ -1006,7 +1131,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1017,6 +1142,7 @@ const COMPLETE_SUB = {
   fw: ['list', 'sizes', 'create', 'show', 'rename', 'set', 'rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels', 'reboot', 'update', 'traffic', 'delete'],
   lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
+  db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
@@ -1056,6 +1182,7 @@ function cmdComplete(raw) {
   else if (cmd === 'fw' && ['rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels'].includes(sub) && cword === 3) c = ['list', 'add', 'rm'];
   else if (cmd === 'lb' && sub === 'listeners' && cur.startsWith('-')) c = ['--http', '--tcp', '--port', '--algorithm', '--sticky', '--proxy-protocol', '--hc-path', '--hc-status', '--hc-interval', '--tls', '--redirect', '--backend-port', '--yes'];
   else if (cmd === 'lb' && cur.startsWith('-')) c = ['--label', '--ip', '--port', '--weight', '--yes'];
+  else if (cmd === 'db' && cur.startsWith('-')) c = ['--label', '--engine', '--size', '--version', '--allow', '--network', '--address', '--database', '--ha', '--password', '--access', '--owner', '--extensions', '--at', '--set', '--target', '--out', '--node', '--request', '--yes'];
   else if (cmd === 'box' && cur.startsWith('-')) c = ['--metered', '--cap', '--plan', '--label', '--keep', '--none', '--yes'];
   else if (cmd === 'fw' && cur.startsWith('-')) c = ['--port', '--proto', '--from', '--to', '--block', '--label', '--wan-ip', '--lan', '--cidr', '--address', '--out', '--remote', '--lans', '--endpoint', '--range', '--yes'];
   process.stdout.write(c.filter((x) => x.startsWith(cur)).join('\n') + '\n');
@@ -1163,6 +1290,22 @@ Usage: qc <command> [args] [--json]
   box keys <id> list|set <key-id…>|set --none          key-based SFTP (panel key manager ids)
   box delete <id> --yes
 
+  db list | sizes                   your database instances / engines, sizes with all-in prices
+  db create --label <n> --engine postgres|mariadb|valkey [--size s] (--allow <cidr,…> | --network <id>) [--database d] [--ha] --yes
+                                    builds dedicated server(s), bills hourly; admin password printed ONCE
+  db show <id>                      connection, users, databases, access, backups, usage
+  db admin-password <id> [rotate --yes]       one-time reveal / fresh password
+  db users <id> list|add <name>|password <uid>|grant <uid> <db-id> <role>|rm <uid> --yes
+  db databases <id> list|add <name> [--extensions a,b]|drop <did> --yes
+  db allow <id> list|add <cidr>|rm <eid>      access list (public instances)
+  db set <id> [key=value…]          engine settings (alone: show current + settable keys)
+  db start|stop|shutdown|reboot <id> [--yes]   single instance power;  db switchover <id> <node> --yes (HA)
+  db backup <id>                    full backup now
+  db restore <id> --at <utc> [--label l] --yes     NEW instance from a point in time
+  db recover <id> <database> --at <utc> [--target n]   one database back INTO this instance
+  db logs <id> [--request] | db ca <id> --out ca.pem | db alerts <id> on|off
+  db delete <id> --yes
+
   dns zones                         your hosted zones + our nameservers
   dns add <domain>                  add a zone
   dns show <zone>                   all record sets (zone by id or name)
@@ -1215,6 +1358,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'fw': case 'firewall': return cmdFw(pos, flags);
     case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
     case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
+    case 'db': case 'database': case 'databases': return cmdDb(pos, flags);
     case 'dns': return cmdDns(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);

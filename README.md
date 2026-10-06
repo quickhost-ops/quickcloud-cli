@@ -1,7 +1,7 @@
 # quickcloud-cli (`qc`)
 
 A tiny, **zero-dependency** command-line tool for the QuickHost QuickCloud API
-(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes and DNS straight from your shell —
+(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes, managed databases and DNS straight from your shell —
 scriptable, pipeable, automatable.
 
 > **Read before you run.** `qc` is a single, self-contained file. It has no
@@ -223,6 +223,32 @@ qc box delete 12 --yes
 
 Snapshots are read-only under `/.zfs/snapshot/<name>/` on the box itself - restore
 by copying files back over SFTP.
+
+**Managed databases** (PostgreSQL / MariaDB / Valkey on dedicated resources,
+optionally a 3-node HA cluster). An instance is real servers billing hourly from
+the moment it exists, so `create` and `restore` are `--yes` gated and idempotent;
+every password is printed once and never retrievable; there is no shell:
+
+```sh
+qc db sizes                                   # engines + sizes with ALL-IN monthly prices
+qc db create --label app --engine postgres --size s --allow 198.51.100.7/32 --database app --yes
+                                              # admin password printed ONCE
+qc db show 5                                  # connection details, users, databases, backups, usage
+qc db ca 5 --out ca.pem                       # the CA your clients verify TLS against
+qc db users 5 add app                         # generated password printed once
+qc db users 5 grant 11 3 readwrite
+qc db databases 5 add reports --extensions pgcrypto
+qc db allow 5 add 198.51.100.0/24 --label office
+qc db set 5 max_connections=200               # engine settings from the whitelist
+qc db backup 5                                # full backup now (nightly + PITR run anyway)
+qc db restore 5 --at 2026-10-06T08:30:00Z --label app-restore --yes   # a NEW instance
+qc db recover 5 app --at 2026-10-06T08:30:00Z # one database back INTO this instance
+qc db admin-password 5 rotate --yes
+qc db delete 5 --yes                          # backups kept for the grace period
+```
+
+Private instead of public: `--network <id>` (one of your private networks with a
+router) replaces `--allow`. `--ha` builds a three-node cluster (where offered).
 
 **Hosted DNS** (zones by id or name; record sets are whole-set upserts):
 
