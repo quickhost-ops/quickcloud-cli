@@ -1,7 +1,7 @@
 # quickcloud-cli (`qc`)
 
 A tiny, **zero-dependency** command-line tool for the QuickHost QuickCloud API
-(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers and DNS straight from your shell —
+(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes and DNS straight from your shell —
 scriptable, pipeable, automatable.
 
 > **Read before you run.** `qc` is a single, self-contained file. It has no
@@ -202,6 +202,27 @@ qc lb listeners 3 add --tcp --port 10022      # a raw TCP port on the fleet
 qc lb show 3                                  # live backend health + sessions
 qc lb delete 3 --yes
 ```
+
+**Storage boxes** (quota'd SFTP storage - metered per GB used, or a fixed monthly
+plan - with snapshots, an IP allowlist and key-based login). Creating, resizing and
+mode changes spend credit, so the key needs the `billing` role (or higher):
+
+```sh
+qc box plans                                  # metered price + the fixed plans
+qc box create --metered --cap 100 --label backups --yes   # SFTP password printed ONCE
+qc box create --plan sb-500 --yes
+qc box show 12
+qc box snap 12 auto on --keep 7               # daily snapshots, keep a week
+qc box snap 12 create                         # one now
+qc box allow 12 add 198.51.100.0/24           # SFTP only from here
+qc box keys 12 set 4                          # key-based login (id from the panel key manager)
+qc box resize 12 --cap 250
+qc box password 12 --yes                      # rotate (shown once)
+qc box delete 12 --yes
+```
+
+Snapshots are read-only under `/.zfs/snapshot/<name>/` on the box itself - restore
+by copying files back over SFTP.
 
 **Hosted DNS** (zones by id or name; record sets are whole-set upserts):
 

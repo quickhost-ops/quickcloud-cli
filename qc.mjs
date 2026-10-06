@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.4.0';   // 1.4.0: load balancers (qc lb …); 1.3.1: qc update; 1.3.0: Cloud Firewall; 1.2.0: dedicated servers + hosted DNS
+const VERSION = '1.5.0';   // 1.5.0: storage boxes (qc box …); 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated servers + hosted DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -870,6 +870,80 @@ async function cmdLb(pos, flags) {
   fail(`unknown: lb ${sub} - try list, info, create, show, rename, listeners, backends, domains, delete`);
 }
 
+// --- storage boxes --------------------------------------------------------------
+// Quota'd SFTP storage on the network-storage fleet: metered per GB or a fixed
+// monthly plan; snapshots, IP allowlist, SSH keys. Creating / resizing / mode
+// changes are MONEY (billing.write on the key); the rest is storage.write.
+async function cmdBox(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  const gbCol = (b) => `${b.used_gb ?? 0}/${b.quota_gb}G`;
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/storage-boxes'); const boxes = r.boxes || [];
+    return emit(r, () => {
+      if (!boxes.length) return say(`no storage boxes.  Create one:  qc box create --metered --cap 100 --yes   (see  qc box plans)`);
+      table(['ID', 'LABEL', 'USERNAME', 'MODE', 'USED/QUOTA', 'STATE', 'SNAPS', 'ALLOWLIST'], boxes.map((b) => [b.id, b.label || '—', b.username, b.billing_mode === 'fixed' ? `fixed ${b.plan_name || b.plan_slug}` : 'metered', gbCol(b), b.status === 'deleting' ? 'deleting' : b.state + (b.reason ? ` (${b.reason})` : ''), (b.snapshots || []).length, (b.allowlist || []).length ? `${b.allowlist.length} cidr` : 'anywhere']));
+      say(`\nsftp: ${r.host || '—'} port ${r.sftp_port || '—'}  ·  connect:  sftp -P ${r.sftp_port || 2022} <username>@${r.host || 'host'}`);
+    });
+  }
+  if (sub === 'plans' || sub === 'pricing' || sub === 'sizes') {
+    const r = await api('GET', '/api/v1/storage-boxes');
+    return emit(r, () => {
+      say(`metered: ${money(r.metered?.gb_mo_gbp)}/GB/mo for the space you USE (quota ${r.metered?.floor_gb}-${r.metered?.max_cap_gb} GB)`);
+      if ((r.plans || []).length) { say('fixed plans (billed monthly from credit):'); table(['  SLUG', 'NAME', 'SIZE', '£/MO'], r.plans.map((p) => ['  ' + p.slug, p.name, `${p.size_gb}G`, money(p.price_gbp ?? (p.price_micro != null ? p.price_micro / 1e6 : null))])); }
+      say(`\nlimits: ${r.max_boxes} boxes · ${r.max_snapshots} snapshots each  ·  sftp ${r.host || '—'}:${r.sftp_port || '—'}`);
+    });
+  }
+  if (sub === 'create' || sub === 'new') {
+    if (!flags.metered && !flags.plan) fail('usage: qc box create --metered --cap <GB> [--label l] --yes   |   --plan <slug> [--label l] --yes');
+    if (!flags.yes) fail('a storage box bills from creation - re-run with --yes');
+    const body = flags.plan ? { mode: 'fixed', plan: flags.plan } : { mode: 'metered', cap_gb: +flags.cap };
+    if (flags.metered && !flags.cap) fail('metered boxes need --cap <GB>');
+    if (flags.label) body.label = flags.label;
+    const r = await api('POST', '/api/v1/storage-boxes', body, idemKey('box-create'));
+    return emit(r, () => { const b = r.box || {}; say(`storage box #${b.id} created (${b.quota_gb} GB, ${b.billing_mode}).`); say(`sftp username : ${b.username}`); say(`sftp password : ${r.password}   (shown ONCE - store it, or attach an SSH key:  qc box keys ${b.id} set <key-id>)`); say(`connect       : sftp -P ${r.sftp_port || 2022} ${b.username}@${r.host || 'host'}`); });
+  }
+  const id = need(pos[0], `qc box ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/storage-boxes/${id}`); const b = r.box || {};
+    return emit(r, () => {
+      say(`#${b.id}  ${b.label || ''}  ${b.username}  [${b.status === 'deleting' ? 'deleting' : b.state}${b.reason ? ` - ${b.reason}` : ''}]`);
+      say(`storage : ${gbCol(b)}  ${b.billing_mode === 'fixed' ? `fixed plan ${b.plan_name || b.plan_slug}${b.period_end ? `, renews ${String(b.period_end).slice(0, 10)}` : ''}${b.pending_plan_slug ? ` → ${b.pending_plan_slug} at renewal` : ''}` : 'metered (pay for what you use)'}`);
+      say(`snapshots: ${b.auto_snap ? `daily, keep ${b.auto_keep}` : 'manual only'}${(b.snapshots || []).length ? '' : '  (none yet)'}`);
+      for (const sn of b.snapshots || []) say(`  #${sn.id}  ${sn.name}  ${sn.kind}  ${sn.status}${sn.gb != null ? `  ${sn.gb}G` : ''}  ${sn.created_at || ''}`);
+      say(`access  : ${(b.allowlist || []).length ? b.allowlist.map((a) => `${a.cidr} [#${a.id}]`).join(', ') : 'from anywhere'}`);
+      say(`ssh keys: ${(b.keys || []).length ? b.keys.map((k) => `${k.label} [#${k.id}]`).join(', ') : 'none (password only)'}`);
+      say(`restore : snapshots are read-only under /.zfs/snapshot/<name>/ over SFTP - copy files back from there`);
+    });
+  }
+  if (sub === 'password' || sub === 'passwd') { if (!flags.yes) fail('this replaces the current SFTP password - re-run with --yes'); const r = await api('POST', `/api/v1/storage-boxes/${id}/password`, {}); return emit(r, () => say(`new sftp password for ${r.username || 'box ' + id}: ${r.password}   (shown ONCE)`)); }
+  if (sub === 'resize') { if (!flags.cap && !flags.plan) fail('usage: qc box resize <id> --cap <GB>   |   --plan <slug>'); const r = await api('POST', `/api/v1/storage-boxes/${id}/resize`, flags.plan ? { plan: flags.plan } : { cap_gb: +flags.cap }); return emit(r, () => say(`quota now ${r.box?.quota_gb} GB${r.box?.pending_plan_slug ? ` (plan change to ${r.box.pending_plan_slug} applies at renewal)` : ''}.`)); }
+  if (sub === 'mode') { const mode = need(pos[1], 'qc box mode <id> metered|fixed [--plan <slug>]'); const r = await api('POST', `/api/v1/storage-boxes/${id}/mode`, { mode, plan: flags.plan }); return emit(r, () => say(`now ${r.box?.billing_mode}${r.box?.plan_slug ? ` (${r.box.plan_slug})` : ''}.`)); }
+  if (sub === 'snap' || sub === 'snapshots' || sub === 'snapshot') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/storage-boxes/${id}`); return emit({ snapshots: r.box?.snapshots || [] }, () => table(['ID', 'NAME', 'KIND', 'STATUS', 'SIZE', 'CREATED'], (r.box?.snapshots || []).map((sn) => [sn.id, sn.name, sn.kind, sn.status, sn.gb != null ? `${sn.gb}G` : '—', sn.created_at || '—']))); }
+    if (act === 'create' || act === 'take') { const r = await api('POST', `/api/v1/storage-boxes/${id}/snapshots`, {}); return emit(r, () => say(`snapshot ${r.snapshot?.name || r.snapshot?.id} queued.`)); }
+    if (act === 'auto') { const on = (pos[2] || '').toLowerCase(); if (!['on', 'off'].includes(on)) fail('usage: qc box snap <id> auto on|off [--keep n]'); const r = await api('POST', `/api/v1/storage-boxes/${id}/autosnap`, { enabled: on === 'on', keep: flags.keep ? +flags.keep : undefined }); return emit(r, () => say(`daily snapshots ${on}${on === 'on' ? `, keeping ${r.box?.auto_keep}` : ''}.`)); }
+    const sid = need(pos[2], `qc box snap <id> ${act} <snapshot-id>`);
+    if (act === 'rm' || act === 'delete') { const r = await api('DELETE', `/api/v1/storage-boxes/${id}/snapshots/${sid}`); return emit(r, () => say('snapshot deletion queued.')); }
+    fail('usage: qc box snap <id> list|create|auto on|off [--keep n]|rm <snapshot-id>');
+  }
+  if (sub === 'allow' || sub === 'allowlist') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/storage-boxes/${id}`); return emit({ allowlist: r.box?.allowlist || [] }, () => ((r.box?.allowlist || []).length ? table(['ID', 'CIDR'], r.box.allowlist.map((a) => [a.id, a.cidr])) : say('no allowlist - reachable from anywhere.'))); }
+    if (act === 'add') { const cidr = need(pos[2], 'qc box allow <id> add <cidr>'); const r = await api('POST', `/api/v1/storage-boxes/${id}/allowlist`, { cidr }); return emit(r, () => say(`allowed ${cidr} (${r.allowlist?.length} entr${r.allowlist?.length === 1 ? 'y' : 'ies'}).`)); }
+    if (act === 'rm' || act === 'delete') { const eid = need(pos[2], 'qc box allow <id> rm <entry-id>'); const r = await api('DELETE', `/api/v1/storage-boxes/${id}/allowlist/${eid}`); return emit(r, () => say(r.allowlist?.length ? 'entry removed.' : 'entry removed - the box is reachable from anywhere again.')); }
+    fail('usage: qc box allow <id> list|add <cidr>|rm <entry-id>');
+  }
+  if (sub === 'keys' || sub === 'key') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/storage-boxes/${id}/keys`); return emit(r, () => ((r.keys || []).length ? table(['ID', 'LABEL', 'KEY'], r.keys.map((k) => [k.id, k.label, (k.public_key || '').slice(0, 40) + '…'])) : say('no SSH keys attached (password login only). Keys come from the panel key manager.'))); }
+    if (act === 'set') { const ids = pos.slice(2).map(Number).filter(Number.isInteger); if (!ids.length && !flags.none) fail('usage: qc box keys <id> set <key-id> [<key-id>…]   |   set --none'); const r = await api('PUT', `/api/v1/storage-boxes/${id}/keys`, { key_ids: flags.none ? [] : ids }); return emit(r, () => say(`${r.keys?.length || 0} key(s) attached.`)); }
+    fail('usage: qc box keys <id> list|set <key-id…>|set --none');
+  }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail(`deleting storage box ${id} DESTROYS its data and snapshots - re-run with --yes`); const r = await api('DELETE', `/api/v1/storage-boxes/${id}`, undefined, idemKey('box-delete')); return emit(r, () => say(`storage box ${id} is being deleted.`)); }
+  fail(`unknown: box ${sub} - try list, plans, create, show, password, resize, mode, snap, allow, keys, delete`);
+}
+
 // --- hosted DNS ---------------------------------------------------------------
 // Zones by id or name; record sets are whole-set upserts (Route-53 style), so
 // `qc dns set example.com www A 203.0.113.10 203.0.113.11` replaces the set.
@@ -932,7 +1006,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -942,6 +1016,7 @@ const COMPLETE_SUB = {
   dedi: ['list', 'stock', 'buy', 'show', 'reinstall', 'on', 'off', 'reboot', 'status', 'rescue', 'netboot', 'disarm', 'console', 'console-clear', 'bmc-reset', 'job', 'bandwidth', 'ips', 'storage', 'release'],
   fw: ['list', 'sizes', 'create', 'show', 'rename', 'set', 'rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels', 'reboot', 'update', 'traffic', 'delete'],
   lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
+  box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
@@ -981,6 +1056,7 @@ function cmdComplete(raw) {
   else if (cmd === 'fw' && ['rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels'].includes(sub) && cword === 3) c = ['list', 'add', 'rm'];
   else if (cmd === 'lb' && sub === 'listeners' && cur.startsWith('-')) c = ['--http', '--tcp', '--port', '--algorithm', '--sticky', '--proxy-protocol', '--hc-path', '--hc-status', '--hc-interval', '--tls', '--redirect', '--backend-port', '--yes'];
   else if (cmd === 'lb' && cur.startsWith('-')) c = ['--label', '--ip', '--port', '--weight', '--yes'];
+  else if (cmd === 'box' && cur.startsWith('-')) c = ['--metered', '--cap', '--plan', '--label', '--keep', '--none', '--yes'];
   else if (cmd === 'fw' && cur.startsWith('-')) c = ['--port', '--proto', '--from', '--to', '--block', '--label', '--wan-ip', '--lan', '--cidr', '--address', '--out', '--remote', '--lans', '--endpoint', '--range', '--yes'];
   process.stdout.write(c.filter((x) => x.startsWith(cur)).join('\n') + '\n');
 }
@@ -1077,6 +1153,16 @@ Usage: qc <command> [args] [--json]
   lb domains <id> add <domain> | verify <did> | rm <did>
   lb delete <id> --yes
 
+  box list | plans                  your storage boxes / metered price + fixed plans
+  box create --metered --cap <GB> | --plan <slug> [--label l] --yes    SFTP password printed ONCE
+  box show <id>                     usage, snapshots, allowlist, keys
+  box password <id> --yes           new SFTP password (shown once)
+  box resize <id> --cap <GB>|--plan <slug>    box mode <id> metered|fixed [--plan s]
+  box snap <id> list|create|auto on|off [--keep n]|rm <sid>
+  box allow <id> list|add <cidr>|rm <eid>     SFTP allowed from these ranges only
+  box keys <id> list|set <key-id…>|set --none          key-based SFTP (panel key manager ids)
+  box delete <id> --yes
+
   dns zones                         your hosted zones + our nameservers
   dns add <domain>                  add a zone
   dns show <zone>                   all record sets (zone by id or name)
@@ -1128,6 +1214,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'dedi': case 'dedicated': return cmdDedi(pos, flags);
     case 'fw': case 'firewall': return cmdFw(pos, flags);
     case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
+    case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
     case 'dns': return cmdDns(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);
