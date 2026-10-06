@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.8.1';   // 1.8.1: qc tiers + vm create --tier/--storage + qc rdns; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.8.1';   // 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -258,6 +258,17 @@ async function cmdVm(pos, flags) {
       if (want ? st === want : (st === 'running' || st === 'stopped')) return emit(r, () => say(`VM #${id}: ${st}  ipv4: ${r.vm?.ipv4 || '—'}`));
       await new Promise((res) => setTimeout(res, 1500));
     }
+  }
+  if (sub === 'console' || sub === 'vnc') {
+    // Mint a single-use console session (60s) and open our viewer in the browser;
+    // --raw prints the websocket URL + password for your own noVNC instead.
+    const id = need(pos[0], 'qc vm console <id> [--raw]');
+    const r = await api('POST', `/api/v1/vms/${id}/console`, {});
+    if (JSON_OUT || flags.raw) return emit(r, () => { say(`websocket : ${r.websocket_url}`); say(`password  : ${r.password}`); say(`viewer    : ${r.url}`); say('(single-use, expires in 60s - connect now)'); });
+    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    const res = spawnSync(opener, [r.url], { stdio: 'ignore', shell: process.platform === 'win32' });
+    if (res.error || res.status !== 0) { say(`open this in a browser within 60 seconds:\n  ${r.url}`); return; }
+    return say(`console opened in your browser (single-use link; run again for a fresh one).`);
   }
   if (sub === 'ssh') {
     const id = need(pos[0], 'qc vm ssh <id> [--user u]');
@@ -1390,7 +1401,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
 const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
-  vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
+  vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh', 'console'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
   snap: ['list', 'create', 'rollback', 'rm'],
   backup: ['list', 'create', 'restore', 'rm'],
@@ -1482,6 +1493,7 @@ Usage: qc <command> [args] [--json]
   vm resize <id> [--vcpu n] [--ram GB] [--disk GB]
   vm wait <id> [--status running|stopped]   block until VM reaches a state
   vm ssh <id> [--user u] [-- ssh args…]     open an SSH session to the VM
+  vm console <id> [--raw]           VNC console in your browser (--raw: websocket URL + password for your own noVNC)
   vm delete <id> --yes
 
   net list                          list your private networks

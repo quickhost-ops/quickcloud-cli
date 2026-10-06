@@ -59,6 +59,7 @@ qc vm rename 101 web-prod
 qc vm resize 101 --vcpu 4 --ram 8
 qc vm wait 101                  # block until the VM is running (or --status stopped)
 qc vm ssh 101 --user ubuntu     # SSH straight in using the VM's IP
+qc vm console 101               # VNC console in your browser (--raw: websocket URL + password for your own noVNC)
 qc vm delete 101 --yes
 
 qc job wait 5567                # block until an async job finishes
