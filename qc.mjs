@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.7.0';   // 1.7.0: SMTP relay (qc relay …); 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.8.0';   // 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -80,6 +80,8 @@ async function api(method, p, body, extraHeaders = {}) {
     if (e && e.need_terms) msg += '\n  accept the credit terms once in the panel (Billing) - the API cannot accept them for you.';
     if (e && e.code === 'cleanup_fee') msg += '\n  re-run with --pay-cleanup-fee to accept the fee.';
     if (e && e.code === 'plan_locked') msg += '\n  this needs a Pay-as-you-go workspace - switch in the panel (Billing).';
+    if (e && e.code === 'charge_confirmation_required') msg += '\n  re-run with --accept-charge to go ahead and pay from your credit.';
+    if (e && e.need_payg) msg += '\n  switch to Pay-as-you-go in the panel (Billing) to keep building.';
     fail(msg);
   }
   return json || {};
@@ -1069,6 +1071,188 @@ async function cmdDb(pos, flags) {
   fail(`unknown: db ${sub} - try list, sizes, create, show, rename, admin-password, start|stop|shutdown|reboot, switchover, logs, recovery, alerts, ca, users, databases, adopt, set, allow, backup, restore, recover, delete`);
 }
 
+// --- Websites (static hosting + the AI builder) --------------------------------
+// The whole journey from the shell: create → deploy a folder (or hand the AI
+// builder a brief) → preview link → publish → live link.
+const WEB_SKIP = new Set(['.git', 'node_modules', '.DS_Store', 'Thumbs.db']);
+function walkDir(dir, base = dir, out = []) {
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (WEB_SKIP.has(ent.name) || ent.name.startsWith('.')) continue;
+    const full = path.join(dir, ent.name);
+    if (ent.isDirectory()) walkDir(full, base, out);
+    else if (ent.isFile()) out.push({ full, rel: path.relative(base, full).split(path.sep).join('/') });
+  }
+  return out;
+}
+function sayWebSite(s) {
+  say(`#${s.id}  ${s.label}  [${s.status}${s.suspended ? ': ' + (s.suspend_reason || 'suspended by staff') : ''}${s.abuse_hold ? ' - ON HOLD (abuse case)' : ''}]`);
+  say(`  hostname : ${s.hostname || '—'}`);
+  say(`  live     : ${s.url || '(not published)'}${s.live_version ? `   v${s.live_version.n} published ${s.live_version.published_at}` : ''}`);
+  say(`  preview  : ${s.preview_url || '—'}`);
+  if (s.domains?.length) say(`  domains  : ${s.domains.map((d) => `${d.domain} [${d.status}]`).join(', ')}`);
+  if (s.cost) say(`  cost     : ${money(s.cost.hourly)}/h, at most ${money(s.cost.monthly_max)}/month while published${s.cost.billed ? ' (billing now)' : ''}`);
+}
+function sayWebDomain(d) {
+  say(`#${d.id}  ${d.domain}  [${d.verified ? 'verified ' + (d.verified_at || '') : 'pending'}]${d.last_error ? `   (${d.last_error})` : ''}`);
+  if (!d.verified) {
+    const apex = d.domain.split('.').length <= 2;
+    if (d.verify_cname && !apex) say(`    CNAME  ${d.domain}  →  ${d.verify_cname}`);
+    if (apex && d.apex_addresses) { if (d.apex_addresses.v4) say(`    A      ${d.domain}  →  ${d.apex_addresses.v4}`); if (d.apex_addresses.v6) say(`    AAAA   ${d.domain}  →  ${d.apex_addresses.v6}`); }
+    if (d.verify_txt) say(`    TXT    ${d.verify_txt.name}  →  ${d.verify_txt.value}   (proves you own the domain)`);
+  }
+}
+async function webWaitJob(jobId, label) {
+  const started = Date.now();
+  for (;;) {
+    const r = await api('GET', `/api/v1/jobs/${jobId}`);
+    const st = r.job?.status;
+    if (st && st !== 'queued' && st !== 'running') return r.job;
+    if (!JSON_OUT) process.stderr.write(`\r${label}… ${Math.round((Date.now() - started) / 1000)}s `);
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+}
+async function webRun(id, body, flags) {
+  if (flags['accept-charge']) body.accept_charge = true;
+  const r = await api('POST', `/api/v1/websites/${id}/ai`, body);
+  if (flags['no-wait']) return emit(r, () => say(`run #${r.run.id} ${r.run.status} - poll with:  qc job wait ${r.job_id}   then  qc web show ${id}`));
+  const job = await webWaitJob(r.job_id, body.kind === 'build' ? 'building your website' : 'making the change');
+  if (!JSON_OUT) process.stderr.write('\n');
+  const ai = await api('GET', `/api/v1/websites/${id}/ai`);
+  const run = (ai.runs || []).find((x) => x.id === r.run.id) || r.run;
+  if (run.status !== 'done') fail(`the builder could not finish: ${run.error || job.error || run.status}. Nothing was charged to your credit for a failed run.`);
+  let site = (await api('GET', `/api/v1/websites/${id}`)).site;
+  if (flags.publish) site = (await api('POST', `/api/v1/websites/${id}/publish`, { note: run.prompt?.slice(0, 80) }, idemKey('web-publish'))).site;
+  return emit({ run, site }, () => {
+    say(`done: ${run.summary || '(no summary)'}`);
+    if (run.files_touched?.length) say(`files: ${run.files_touched.join(', ')}`);
+    const spent = (run.cost_micro || 0) / 1e6, charged = (run.charged_micro || 0) / 1e6;
+    say(`cost : ${money(spent)}${charged > 0 ? ` (${money(charged)} from your credit, the rest free allowance)` : ' (free allowance)'}   free left this month: ${money((ai.allowance?.free_left_micro || 0) / 1e6)}`);
+    say(`preview: ${site.preview_url || '—'}`);
+    if (site.url) say(`LIVE   : ${site.url}`);
+    else say(`happy with it?  qc web publish ${id}     or re-run with --publish next time`);
+  });
+}
+async function cmdWeb(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/websites');
+    return emit(r, () => {
+      if (!r.sites.length) { say(`no websites yet.  qc web create --label "My site"   then  qc web deploy <id> ./folder   or   qc web build <id> --name "…" --what "…"`); }
+      else table(['ID', 'LABEL', 'STATUS', 'LIVE URL', 'VERSION'], r.sites.map((s) => [s.id, s.label, s.status, s.url || '', s.live_version ? `v${s.live_version.n}` : '']));
+      say(`limits: ${r.limits.max_sites} sites, ${r.limits.max_files} files, ${r.limits.max_file_kb} KB/file, ${r.limits.max_site_mb} MB/site · a published site costs at most ${money(r.month_gbp)}/month · AI builder: ${r.ai_offered ? 'on' : 'off'}`);
+    });
+  }
+  if (sub === 'create' || sub === 'add') {
+    const r = await api('POST', '/api/v1/websites', { label: flags.label || flags.name || pos[0] }, idemKey('web-create'));
+    return emit(r, () => { sayWebSite(r.site); say(`next:  qc web deploy ${r.site.id} ./folder     or     qc web build ${r.site.id} --name "Bob's Bakery" --what "artisan bread in Leeds"`); });
+  }
+  if (sub === 'quick') {
+    // One line → a whole site: create + build (+ --publish).
+    if (!flags.name || !flags.what) fail('usage: qc web quick --name "Business" --what "what it does" [--where town] [--style s] [--colours c] [--tone t] [--details "…"] [--publish] [--accept-charge]');
+    const c = await api('POST', '/api/v1/websites', { label: flags.label || flags.name }, idemKey('web-create'));
+    if (!JSON_OUT) say(`created website #${c.site.id} (${c.site.hostname})`);
+    return webRun(c.site.id, { kind: 'build', brief: { business_name: flags.name, what: flags.what, where: flags.where, style: flags.style, colours: flags.colours, tone: flags.tone, details: flags.details } }, flags);
+  }
+  const id = need(pos[0], `qc web ${sub} <site-id>`);
+  if (sub === 'show' || sub === 'get' || sub === 'info') {
+    const r = await api('GET', `/api/v1/websites/${id}`);
+    return emit(r, () => {
+      sayWebSite(r.site);
+      say(`  draft    : ${r.site.files.length} file(s)${r.site.files.length ? ' - ' + r.site.files.slice(0, 8).map((f) => f.path).join(', ') + (r.site.files.length > 8 ? ', …' : '') : ''}`);
+      if (r.site.versions.length) say(`  versions : ${r.site.versions.map((v) => `v${v.n}#${v.id} (${v.kind}${v.note ? ': ' + v.note : ''})`).join(', ')}`);
+    });
+  }
+  if (sub === 'rename') { const label = need(flags.label || pos[1], 'qc web rename <id> --label "New name"'); const r = await api('PATCH', `/api/v1/websites/${id}`, { label }); return emit(r, () => say(`renamed to ${r.site.label}.`)); }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail('deleting takes the site offline and purges its files - re-run with --yes'); const r = await api('DELETE', `/api/v1/websites/${id}`, undefined, idemKey('web-delete')); return emit(r, () => say('website deleted.')); }
+  if (sub === 'files' || sub === 'ls-files') { const r = await api('GET', `/api/v1/websites/${id}`); return emit({ files: r.site.files }, () => (r.site.files.length ? table(['PATH', 'SIZE', 'TYPE'], r.site.files.map((f) => [f.path, f.size, f.ctype])) : say('the draft is empty.'))); }
+  if (sub === 'put' || sub === 'upload') {
+    const local = need(pos[1], 'qc web put <id> <local-file> [site-path]');
+    const rel = pos[2] || path.basename(local);
+    let bytes; try { bytes = fs.readFileSync(local); } catch (e) { fail(`cannot read ${local}: ${e.message}`); }
+    const r = await api('PUT', `/api/v1/websites/${id}/files`, { path: rel, content_b64: bytes.toString('base64') });
+    return emit(r, () => say(`uploaded ${rel} (${r.file.size} bytes) to the draft - preview it, then  qc web publish ${id}`));
+  }
+  if (sub === 'cat' || sub === 'read') { const p = need(pos[1], 'qc web cat <id> <site-path>'); const r = await api('GET', `/api/v1/websites/${id}/files/content?path=${encodeURIComponent(p)}`); if (JSON_OUT) return emit(r, () => {}); process.stdout.write(Buffer.from(r.file.content_b64, 'base64')); return; }
+  if (sub === 'rm-file' || sub === 'delete-file') { const p = need(pos[1], 'qc web rm-file <id> <site-path>'); const r = await api('DELETE', `/api/v1/websites/${id}/files?path=${encodeURIComponent(p)}`); return emit(r, () => say(`removed ${p} from the draft.`)); }
+  if (sub === 'deploy' || sub === 'push') {
+    // Upload a folder as the draft (every file; stale draft files removed with --clean), then publish unless --no-publish.
+    const dir = need(pos[1], 'qc web deploy <id> <folder> [--clean] [--no-publish] [--note text]');
+    let files; try { files = walkDir(path.resolve(dir)); } catch (e) { fail(`cannot read ${dir}: ${e.message}`); }
+    if (!files.length) fail(`${dir} has no files`);
+    if (!files.some((f) => f.rel === 'index.html')) fail(`${dir} needs an index.html at the top level`);
+    const before = (await api('GET', `/api/v1/websites/${id}`)).site;
+    const have = new Map(before.files.map((f) => [f.path, f]));
+    let sent = 0;
+    for (const f of files) {
+      const bytes = fs.readFileSync(f.full);
+      await api('PUT', `/api/v1/websites/${id}/files`, { path: f.rel, content_b64: bytes.toString('base64') });
+      sent++; if (!JSON_OUT) process.stderr.write(`\ruploading ${sent}/${files.length} ${f.rel.slice(0, 40).padEnd(40)}`);
+    }
+    let removed = 0;
+    if (flags.clean) { const want = new Set(files.map((f) => f.rel)); for (const p of have.keys()) if (!want.has(p)) { await api('DELETE', `/api/v1/websites/${id}/files?path=${encodeURIComponent(p)}`); removed++; } }
+    if (!JSON_OUT && sent) process.stderr.write('\n');
+    let site = before;
+    if (!flags['no-publish']) site = (await api('POST', `/api/v1/websites/${id}/publish`, { note: flags.note || `qc deploy ${path.basename(path.resolve(dir))}` }, idemKey('web-publish'))).site;
+    else site = (await api('GET', `/api/v1/websites/${id}`)).site;
+    return emit({ uploaded: sent, removed, site }, () => {
+      say(`uploaded ${sent} file(s)${removed ? `, ${removed} removed` : ''}.`);
+      if (site.url && !flags['no-publish']) say(`LIVE   : ${site.url}   (v${site.live_version?.n})`); else say(`preview: ${site.preview_url}\n(not published - run  qc web publish ${id}  when ready)`);
+    });
+  }
+  if (sub === 'publish') { const r = await api('POST', `/api/v1/websites/${id}/publish`, { note: flags.note }, idemKey('web-publish')); return emit(r, () => say(`published v${r.site.live_version?.n}:  ${r.site.url}`)); }
+  if (sub === 'unpublish') { if (!flags.yes) fail('this takes the site offline (draft + versions are kept) - re-run with --yes'); const r = await api('POST', `/api/v1/websites/${id}/unpublish`, {}); return emit(r, () => say('site is offline; billing stopped.')); }
+  if (sub === 'versions') { const r = await api('GET', `/api/v1/websites/${id}`); return emit({ versions: r.site.versions }, () => (r.site.versions.length ? table(['ID', 'V', 'KIND', 'FILES', 'BYTES', 'PUBLISHED', 'NOTE', 'LIVE'], r.site.versions.map((v) => [v.id, v.n, v.kind, v.files, v.bytes, v.published_at || '', v.note || '', r.site.live_version?.id === v.id ? '←' : ''])) : say('nothing published yet.'))); }
+  if (sub === 'rollback') { const vid = need(pos[1], 'qc web rollback <id> <version-id>   (ids from  qc web versions)'); const r = await api('POST', `/api/v1/websites/${id}/rollback`, { version_id: +vid }); return emit(r, () => say(`v${r.site.live_version?.n} is live again:  ${r.site.url}`)); }
+  if (sub === 'restore') { const vid = need(pos[1], 'qc web restore <id> <version-id>'); const r = await api('POST', `/api/v1/websites/${id}/draft-restore`, { version_id: +vid }); return emit(r, () => say(`draft now holds the files of version #${vid} (${r.site.files.length} files). Nothing is live until you publish.`)); }
+  if (sub === 'preview') { const act = (pos[1] || 'show').toLowerCase(); if (act === 'rotate') { const r = await api('POST', `/api/v1/websites/${id}/preview-token`, {}); return emit(r, () => say(`new preview link: ${r.site.preview_url}`)); } const r = await api('GET', `/api/v1/websites/${id}`); return emit({ preview_url: r.site.preview_url }, () => say(r.site.preview_url || 'no preview (site suspended or on hold)')); }
+  if (sub === 'export') { const out = flags.out || `website-${id}.zip`; const { url, token } = cfg(); const res = await fetch(`${url}/api/v1/websites/${id}/export.zip`, { headers: { Authorization: `Bearer ${token}` } }); if (!res.ok) { let j = null; try { j = JSON.parse(await res.text()); } catch { /* */ } fail((j && j.error && j.error.message) || `HTTP ${res.status}`); } fs.writeFileSync(out, Buffer.from(await res.arrayBuffer())); return say(`draft saved to ${out}`); }
+  if (sub === 'domains' || sub === 'domain') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/websites/${id}`); return emit({ domains: r.site.domains }, () => (r.site.domains.length ? r.site.domains.forEach((d) => sayWebDomain(d)) : say(`no custom domains - add one:  qc web domains ${id} add www.example.com`))); }
+    if (act === 'add') { const domain = need(pos[2], `qc web domains ${id} add <domain>`); const r = await api('POST', `/api/v1/websites/${id}/domains`, { domain }); const d = (r.site.domains || []).find((x) => x.domain === domain.toLowerCase().replace(/\.$/, '')) || r.site.domains?.at(-1); return emit(r, () => { say(`added ${d?.domain} - publish the DNS below, then  qc web domains ${id} verify ${d?.id}`); if (d) sayWebDomain(d); }); }
+    if (act === 'verify' || act === 'check') { const did = need(pos[2], `qc web domains ${id} verify <domain-id>`); const r = await api('POST', `/api/v1/websites/${id}/domains/${did}/verify`, {}); return emit(r, () => { say(r.ok ? 'verified - the domain goes live on the next config push (a few minutes, certificate included).' : `not yet: ${r.reason || 'DNS not found'}`); const d = (r.site?.domains || []).find((x) => x.id === +did); if (d) sayWebDomain(d); }); }
+    if (act === 'rm' || act === 'delete') { const did = need(pos[2], `qc web domains ${id} rm <domain-id> --yes`); if (!flags.yes) fail('re-run with --yes to remove the domain'); const r = await api('DELETE', `/api/v1/websites/${id}/domains/${did}`); return emit(r, () => say('domain removed.')); }
+    fail(`usage: qc web domains ${id} list|add <domain>|verify <did>|rm <did> --yes`);
+  }
+  if (sub === 'ai' || sub === 'runs') {
+    const r = await api('GET', `/api/v1/websites/${id}/ai`);
+    return emit(r, () => {
+      const a = r.allowance, pr = r.pricing;
+      say(`free allowance: ${money(a.free_left_micro / 1e6)} left of ${money(a.free_micro / 1e6)} this month (${a.pct_used}% used)${a.blocked ? a.need_payg ? '  - used up: switch to Pay-as-you-go in the panel to keep building' : '  - used up and no credit: top up in the panel' : a.free_left_micro <= 0 ? '  - used up: further runs come from your credit (--accept-charge)' : ''}`);
+      say(`after that      : typically ${money(pr.typical_build_micro / 1e6)} per build, ${money(pr.typical_edit_micro / 1e6)} per change, never more than ${money(pr.run_cap_micro / 1e6)} per request`);
+      if (r.busy) say('the builder is working on this site right now.');
+      if (r.runs.length) table(['RUN', 'KIND', 'STATUS', 'COST', 'CHARGED', 'ASKED', 'RESULT'], r.runs.map((x) => [x.id, x.kind, x.status + (x.undone ? ' (undone)' : ''), money(x.cost_micro / 1e6), x.charged_micro ? money(x.charged_micro / 1e6) : '', (x.prompt || '').slice(0, 36), (x.summary || x.error || '').slice(0, 50)]));
+    });
+  }
+  if (sub === 'build') {
+    if (!flags.name || !flags.what) fail(`usage: qc web build ${id} --name "Business" --what "what it does" [--where town] [--style s] [--colours c] [--tone t] [--details "…"] [--publish] [--accept-charge] [--no-wait]`);
+    return webRun(id, { kind: 'build', brief: { business_name: flags.name, what: flags.what, where: flags.where, style: flags.style, colours: flags.colours, tone: flags.tone, details: flags.details } }, flags);
+  }
+  if (sub === 'edit' || sub === 'change' || sub === 'ask') {
+    const message = pos.slice(1).join(' ') || flags.message;
+    if (!message) fail(`usage: qc web edit ${id} "make the heading blue and add opening hours" [--publish] [--accept-charge] [--no-wait]`);
+    return webRun(id, { kind: 'edit', message }, flags);
+  }
+  if (sub === 'undo') { const rid = need(pos[1] || flags.run, `qc web undo ${id} <run-id>   (ids from  qc web ai ${id})`); const r = await api('POST', `/api/v1/websites/${id}/ai/${rid}/undo`, {}); return emit(r, () => say('undone - the draft is back as it was before that run.')); }
+  if (sub === 'forms' || sub === 'inbox') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'on' || act === 'off') { const r = await api('PATCH', `/api/v1/websites/${id}/forms`, { enabled: act === 'on' }); return emit(r, () => say(`forms ${act}.`)); }
+    if (act === 'read-all') { const r = await api('POST', `/api/v1/websites/${id}/forms/read-all`, {}); return emit(r, () => say('all messages marked read.')); }
+    if (act === 'rm' || act === 'delete') { const sid = need(pos[2], `qc web forms ${id} rm <message-id>`); const r = await api('DELETE', `/api/v1/websites/${id}/forms/${sid}`); return emit(r, () => say('message deleted.')); }
+    const r = await api('GET', `/api/v1/websites/${id}/forms${flags.limit ? `?limit=${flags.limit}` : ''}`);
+    const subs = r.forms?.submissions || r.forms?.items || [];
+    return emit(r, () => (subs.length ? subs.forEach((m) => { say(`#${m.id}  ${m.created_at}  [${m.form}]${m.read_at ? '' : '  NEW'}`); for (const [k, v] of Object.entries(m.fields || {})) say(`    ${k}: ${String(v).slice(0, 200)}`); }) : say('no messages.')));
+  }
+  if (sub === 'subscribers' || sub === 'subs') {
+    if (flags.csv) { const text = await apiText(`/api/v1/websites/${id}/subscribers.csv${flags.list ? `?list=${encodeURIComponent(flags.list)}` : ''}`); const out = flags.out || `subscribers-${id}.csv`; fs.writeFileSync(out, text); return say(`subscribers saved to ${out}`); }
+    const r = await api('GET', `/api/v1/websites/${id}/subscribers${flags.list ? `?list=${encodeURIComponent(flags.list)}` : ''}`);
+    const rows = r.subscribers || r.items || [];
+    return emit(r, () => (rows.length ? table(['ID', 'LIST', 'EMAIL', 'SINCE'], rows.map((x) => [x.id, x.list, x.email, x.created_at])) : say('no subscribers yet.')));
+  }
+  if (sub === 'widgets') { const r = await api('GET', `/api/v1/websites/${id}/widgets`); return emit(r, () => say(JSON.stringify(r.widgets, null, 2))); }
+  fail(`unknown: web ${sub} - try list, create, quick, show, deploy, put, cat, rm-file, publish, unpublish, versions, rollback, restore, preview, export, domains, ai, build, edit, undo, forms, subscribers, delete`);
+}
+
 // --- SMTP relay (QuickSMTP) ---------------------------------------------------
 // Day-2 only: senders, DKIM domains, the delivery log. Subscribing / plan
 // changes are done in the panel (money + reseller ledger).
@@ -1173,7 +1357,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1186,6 +1370,7 @@ const COMPLETE_SUB = {
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   relay: ['status', 'senders', 'domains', 'log'],
+  web: ['list', 'create', 'quick', 'show', 'deploy', 'put', 'cat', 'rm-file', 'files', 'publish', 'unpublish', 'versions', 'rollback', 'restore', 'preview', 'export', 'domains', 'ai', 'build', 'edit', 'undo', 'forms', 'subscribers', 'widgets', 'rename', 'delete'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
 };
@@ -1225,6 +1410,7 @@ function cmdComplete(raw) {
   else if (cmd === 'fw' && ['rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels'].includes(sub) && cword === 3) c = ['list', 'add', 'rm'];
   else if (cmd === 'lb' && sub === 'listeners' && cur.startsWith('-')) c = ['--http', '--tcp', '--port', '--algorithm', '--sticky', '--proxy-protocol', '--hc-path', '--hc-status', '--hc-interval', '--tls', '--redirect', '--backend-port', '--yes'];
   else if (cmd === 'lb' && cur.startsWith('-')) c = ['--label', '--ip', '--port', '--weight', '--yes'];
+  else if (cmd === 'web' && cur.startsWith('-')) c = ['--label', '--name', '--what', '--where', '--style', '--colours', '--tone', '--details', '--publish', '--accept-charge', '--no-wait', '--clean', '--no-publish', '--note', '--out', '--list', '--csv', '--limit', '--yes'];
   else if (cmd === 'relay' && cur.startsWith('-')) c = ['--label', '--reason', '--q', '--sender', '--limit', '--csv', '--out', '--yes'];
   else if (cmd === 'db' && cur.startsWith('-')) c = ['--label', '--engine', '--size', '--version', '--allow', '--network', '--address', '--database', '--ha', '--password', '--access', '--owner', '--extensions', '--at', '--set', '--target', '--out', '--node', '--request', '--yes'];
   else if (cmd === 'box' && cur.startsWith('-')) c = ['--metered', '--cap', '--plan', '--label', '--keep', '--none', '--yes'];
@@ -1355,6 +1541,16 @@ Usage: qc <command> [args] [--json]
   relay domains list|add <domain>|rm <id> --yes       DKIM: prints the TXT record to publish
   relay log [--q text] [--sender id] [--limit n] [--csv --out file]   delivery log
 
+  web list | create [--label l]     websites (static hosting; drafting is free, publishing is paid)
+  web quick --name "Biz" --what "…" [--where t] [--style s] [--details "…"] [--publish]   a WHOLE site in one line (AI)
+  web build <id> --name … --what …  AI: build the draft from a brief, waits, prints the preview link (--publish = go live)
+  web edit <id> "change in plain English" [--publish]    AI: change the draft;  web undo <id> <run>;  web ai <id> = allowance, prices, runs
+  web deploy <id> <folder> [--clean] [--no-publish]      upload a folder and publish - prints the live link
+  web show <id> | files | put <id> <file> [path] | cat <id> <path> | rm-file <id> <path> | export <id> --out site.zip
+  web publish <id> | unpublish <id> --yes | versions <id> | rollback <id> <vid> | restore <id> <vid> | preview <id> [rotate]
+  web domains <id> list|add <domain>|verify <did>|rm <did> --yes      your own domain on the site
+  web forms <id> [list|on|off|read-all|rm <mid>] | subscribers <id> [--csv --out f] | widgets <id> | delete <id> --yes
+
   dns zones                         your hosted zones + our nameservers
   dns add <domain>                  add a zone
   dns show <zone>                   all record sets (zone by id or name)
@@ -1409,6 +1605,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
     case 'db': case 'database': case 'databases': return cmdDb(pos, flags);
     case 'relay': case 'smtp': return cmdRelay(pos, flags);
+    case 'web': case 'site': case 'websites': return cmdWeb(pos, flags);
     case 'dns': return cmdDns(pos, flags);
     case 'job': return cmdJob(pos, flags);
     case 'reseller': return cmdReseller(pos, flags);

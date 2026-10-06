@@ -1,7 +1,7 @@
 # quickcloud-cli (`qc`)
 
 A tiny, **zero-dependency** command-line tool for the QuickHost QuickCloud API
-(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes, managed databases, SMTP relay and DNS straight from your shell —
+(https://quickcloud.uk). Manage your cloud VMs, dedicated servers, Cloud Firewalls, load balancers, storage boxes, managed databases, SMTP relay, websites and DNS straight from your shell —
 scriptable, pipeable, automatable.
 
 > **Read before you run.** `qc` is a single, self-contained file. It has no
@@ -249,6 +249,26 @@ qc db delete 5 --yes                          # backups kept for the grace perio
 
 Private instead of public: `--network <id>` (one of your private networks with a
 router) replaces `--allow`. `--ha` builds a three-node cluster (where offered).
+
+**Websites** (static hosting with the AI builder - a whole site from one line,
+and a link back to look at it):
+
+```sh
+qc web quick --name "Bob's Bakery" --what "artisan bread and cakes" --where Leeds \
+  --details "Open Tue-Sat 8-4. Phone 0113 496 0000."          # creates + builds, prints the preview link
+qc web edit 7 "add an opening-hours box and make the heading blue"
+qc web publish 7                                                 # prints the live https:// link
+qc web deploy 7 ./dist                                           # or upload your own folder and publish
+qc web domains 7 add www.example.com                             # prints the DNS record to publish
+qc web ai 7                                                      # allowance left, prices, past runs; qc web undo 7 <run>
+```
+
+Drafting and the preview are free; publishing is the paid moment (Pay-as-you-go
+workspaces). The AI builder is free up to a monthly allowance; once that is used
+up a run comes out of your credit and `qc` refuses unless you pass
+`--accept-charge` (the prices are printed first), so a script never spends money
+it did not know about. A key limited to one site can edit, build and publish
+that site but never create or delete sites - the right key for a deploy bot.
 
 **SMTP relay** (QuickSMTP - one sender login per application, DKIM-signed
 sending domains, a searchable delivery log; subscribe and change plans in the panel):
