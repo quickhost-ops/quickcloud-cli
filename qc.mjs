@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.8.0';   // 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.8.1';   // 1.8.1: qc tiers + vm create --tier/--storage + qc rdns; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -161,6 +161,35 @@ async function cmdWhoami() {
 }
 
 const FIELD_FLAG = { ciuser: '--user', password: '--password', sshkeys: '--ssh-key', user_data: '(cloud-init — panel only)' };
+// Reverse DNS: list your addresses with their PTRs; set or clear one.
+async function cmdRdns(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/rdns'); const ips = r.ips || [];
+    return emit(r, () => (ips.length ? table(['ADDRESS', 'PTR', 'ON'], ips.map((i) => [i.address + (i.block ? `  (${i.block})` : ''), i.ptr || '—', i.vm_name ? `VM ${i.vm_name}` : i.device_id ? `device #${i.device_id}` : ''])) : say('no public addresses assigned.')));
+  }
+  if (sub === 'set') {
+    const address = need(pos[0], 'qc rdns set <ip> <hostname> [--colo6]'); const ptr = need(pos[1], 'qc rdns set <ip> <hostname>   (e.g. mail.example.com - and point an A/AAAA record at the IP too)');
+    const r = await api('PUT', flags.colo6 ? '/api/v1/rdns/ipv6' : '/api/v1/rdns', { address, ptr });
+    return emit(r, () => say(`${r.address}  →  ${r.ptr}   (live; make sure ${r.ptr} resolves back to ${r.address})`));
+  }
+  if (sub === 'clear' || sub === 'reset' || sub === 'rm') {
+    const address = need(pos[0], 'qc rdns clear <ip> [--colo6]');
+    const r = await api('PUT', flags.colo6 ? '/api/v1/rdns/ipv6' : '/api/v1/rdns', { address, ptr: '' });
+    return emit(r, () => say(r.removed ? `${r.address}: PTR removed.` : `${r.address}  →  ${r.ptr}   (pool default restored)`));
+  }
+  fail('usage: qc rdns list | set <ip> <hostname> | clear <ip>    (--colo6 for a specific IPv6 address inside colo space you own)');
+}
+// The tiers (clusters) a VM can be built on, with YOUR rates. `qc vm create`
+// without --tier lands on the default (HA) tier - the dearer one - so this
+// is how a customer finds the cheaper slug.
+async function cmdTiers() {
+  const r = await api('GET', '/api/v1/clusters');
+  return emit(r, () => {
+    table(['TIER', 'LABEL', 'HA', 'DEFAULT', '£/VCPU/H', '£/GB RAM/H', '£/GB DISK/H', 'STORAGE OPTIONS'], (r.clusters || []).map((c) => [c.slug, c.label, c.ha ? 'yes' : 'no', c.is_default ? 'yes' : '', c.pricing.vcpu_hr.toFixed(4), c.pricing.ram_gb_hr.toFixed(4), c.pricing.disk_gb_hr.toFixed(5), (c.storages || []).map((x) => x.name + (x.is_default ? '*' : '')).join(', ') || '(default)']));
+    say(`qc vm create … --tier <slug>   (no --tier = the default tier, '${r.default}')`);
+  });
+}
 async function cmdTemplates(pos) {
   const r = await api('GET', '/api/v1/templates');
   const t = r.templates || [];
@@ -184,12 +213,12 @@ async function cmdVm(pos, flags) {
   const powers = { start: 'start', stop: 'stop', shutdown: 'shutdown', reboot: 'reboot' };
   if (sub === 'list' || sub === 'ls') {
     const r = await api('GET', '/api/v1/vms'); const vms = r.vms || [];
-    return emit(r, () => (vms.length ? table(['ID', 'NAME', 'STATUS', 'VCPU', 'RAM', 'DISK', 'IPV4'], vms.map((v) => [v.id, v.name, v.status, v.vcpu, gb(v.ram_mb), `${v.disk_gb}G`, v.ipv4 || '—'])) : say('no VMs.')));
+    return emit(r, () => (vms.length ? table(['ID', 'NAME', 'STATUS', 'TIER', 'VCPU', 'RAM', 'DISK', 'IPV4'], vms.map((v) => [v.id, v.name, v.status, v.tier ? v.tier.slug : '—', v.vcpu, gb(v.ram_mb), `${v.disk_gb}G`, v.ipv4 || '—'])) : say('no VMs.')));
   }
   if (sub === 'get' || sub === 'show') {
     const id = need(pos[0], 'qc vm show <id>');
     const r = await api('GET', `/api/v1/vms/${id}`); const v = r.vm || {};
-    return emit(r, () => { say(`#${v.id}  ${v.name}  [${v.status}]`); say(`spec  : ${v.vcpu} vCPU · ${gb(v.ram_mb)} RAM · ${v.disk_gb}G disk`); say(`ipv4  : ${v.ipv4 || '—'}`); if (v.ipv6) say(`ipv6  : ${v.ipv6}`); for (const p of v.priv_ips || []) say(`priv  : ${p.address}  (${p.network})`); });
+    return emit(r, () => { say(`#${v.id}  ${v.name}  [${v.status}]`); say(`spec  : ${v.vcpu} vCPU · ${gb(v.ram_mb)} RAM · ${v.disk_gb}G disk`); if (v.tier) say(`tier  : ${v.tier.label} (${v.tier.slug})${v.tier.ha ? ' - high availability' : ''}`); say(`ipv4  : ${v.ipv4 || '—'}`); if (v.ipv6) say(`ipv6  : ${v.ipv6}`); for (const p of v.priv_ips || []) say(`priv  : ${p.address}  (${p.network})`); });
   }
   if (powers[sub]) {
     const id = need(pos[0], `qc vm ${sub} <id>`);
@@ -197,9 +226,11 @@ async function cmdVm(pos, flags) {
     return emit(r, () => say(`${sub} queued (job ${r.job?.id}).`));
   }
   if (sub === 'create' || sub === 'new') {
-    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--preset <name>] [--priv-net <id>] [--no-ip] [--wait]');
+    if (!flags.name) fail('usage: qc vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template> [--ssh-key "<pub>"] [--user u] [--password p] [--user-data-file <path>] [--preset <name>] [--priv-net <id>] [--tier <slug>] [--storage <name>] [--no-ip] [--wait]   (no --tier = the default HA tier; see  qc tiers)');
     if (!flags.os) fail('missing --os <template> — run `qc templates` to list them');
     const body = { name: flags.name, template: flags.os, vcpu: +flags.vcpu || 1, ram_mb: Math.round((+flags.ram || 1) * 1024), disk_gb: +flags.disk || 20, fields: {} };
+    if (flags.tier || flags.cluster) body.cluster = flags.tier || flags.cluster;   // omitted = the default (HA) tier - see `qc tiers`
+    if (flags.storage) body.storage = flags.storage;
     if (flags['no-ip']) body.ip = 'none';
     if (flags.user) body.fields.ciuser = flags.user;
     if (flags.password) body.fields.password = flags.password;
@@ -1357,7 +1388,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1370,6 +1401,7 @@ const COMPLETE_SUB = {
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   relay: ['status', 'senders', 'domains', 'log'],
+  rdns: ['list', 'set', 'clear'],
   web: ['list', 'create', 'quick', 'show', 'deploy', 'put', 'cat', 'rm-file', 'files', 'publish', 'unpublish', 'versions', 'rollback', 'restore', 'preview', 'export', 'domains', 'ai', 'build', 'edit', 'undo', 'forms', 'subscribers', 'widgets', 'rename', 'delete'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
   job: ['get', 'wait'], config: ['show', 'set'], reseller: ['customers'],
@@ -1386,7 +1418,7 @@ function cmdComplete(raw) {
   else if (cmd === 'config' && sub === 'set' && cword === 3) c = ['url', 'token'];
   else if (cmd === 'reseller' && sub === 'customers' && cword === 3) c = ['list', 'create', 'show', 'suspend', 'resume', 'delete', 'sso'];
   else if (cmd === 'completion' && cword === 2) c = ['bash', 'zsh'];
-  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--preset', '--priv-net', '--priv-ip', '--no-ip', '--wait'];
+  else if (cmd === 'vm' && sub === 'create' && cur.startsWith('-')) c = ['--name', '--vcpu', '--ram', '--disk', '--os', '--ssh-key', '--user', '--password', '--user-data', '--user-data-file', '--preset', '--priv-net', '--priv-ip', '--tier', '--storage', '--no-ip', '--wait'];
   else if (cmd === 'net' && sub === 'create' && cur.startsWith('-')) c = ['--cidr', '--gateway'];
   else if (cmd === 'net' && sub === 'attach' && cur.startsWith('-')) c = ['--ip'];
   else if (cmd === 'net' && sub === 'rm' && cur.startsWith('-')) c = ['--yes'];
@@ -1434,12 +1466,15 @@ Usage: qc <command> [args] [--json]
   whoami                            workspace, billing & quota
   templates                         OS templates you can launch from
   templates <name>                  required inputs for one template
+  tiers                             the tiers (clusters) you can build VMs on, with your rates
+  rdns list | set <ip> <hostname> | clear <ip>    reverse DNS (PTR) on your public addresses  (--colo6: any address in colo IPv6 space)
 
   vm list                           list your VMs
   vm show <id>                      VM detail
   vm create --name <n> --vcpu <n> --ram <GB> --disk <GB> --os <template>
             [--ssh-key "<pub>"] [--user u] [--password p]
             [--user-data-file <path>] [--preset <name>] [--no-ip] [--wait]
+            [--tier <slug>] [--storage <name>]   tier = cluster to build on; no --tier = the default HA tier (see  qc tiers)
                                     --user-data-file: cloud-init run on first boot
                                     --preset: a saved cloud-init preset (qc preset list)
   vm start|stop|shutdown|reboot <id>
@@ -1594,6 +1629,8 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'config': return cmdConfig(pos, flags);
     case 'whoami': case 'workspace': return cmdWhoami();
     case 'templates': return cmdTemplates(pos);
+    case 'tiers': case 'clusters': return cmdTiers();
+    case 'rdns': case 'ptr': return cmdRdns(pos, flags);
     case 'vm': return cmdVm(pos, flags);
     case 'net': return cmdNet(pos, flags);
     case 'snap': case 'snapshot': return cmdSnap(pos, flags);

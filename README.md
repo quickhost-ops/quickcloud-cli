@@ -48,6 +48,12 @@ qc vm create --name web1 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 \
              --user ubuntu --password 'ChangeMe-123!' \
              --ssh-key "ssh-ed25519 AAAA…" \
              --user-data-file cloud-init.yml --wait
+qc tiers                        # the tiers you can build on, with your rates (HA vs standard)
+qc vm create --name web2 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 --tier standard
+                                # no --tier = the default tier, which is the HA one
+qc rdns list                    # your public IPs and their reverse DNS (PTR) names
+qc rdns set 203.0.113.10 mail.example.com
+qc rdns clear 203.0.113.10      # back to the pool default
 qc vm start|stop|shutdown|reboot 101
 qc vm rename 101 web-prod
 qc vm resize 101 --vcpu 4 --ram 8
