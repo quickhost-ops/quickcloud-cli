@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.8.1';   // 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.9.0';   // 1.9.0: qc ips (every address across every product); 1.8.2: qc rdns list shows the colo/BYO blocks you own; 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -161,12 +161,31 @@ async function cmdWhoami() {
 }
 
 const FIELD_FLAG = { ciuser: '--user', password: '--password', sshkeys: '--ssh-key', user_data: '(cloud-init — panel only)' };
+// IP addresses: every address the workspace holds, across every product (the
+// Account → IP addresses page), plus the private networks and their router.
+async function cmdIps(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/ips');
+    const used = (i) => { const u = i.used_by; if (!u) return 'free'; const k = { vm: 'VM', dedicated: 'dedi', colo: 'colo', firewall: 'firewall', database: 'database', byoip: 'BYOIP router', reserved: 'reserved', external: 'on your kit' }[u.kind] || u.kind; return `${k}${u.label ? ' ' + u.label : ''}${u.note ? ' (' + u.note + ')' : ''}`; };
+    return emit(r, () => {
+      const pub = (r.public || []).filter((i) => !flags.free || !i.used_by).filter((i) => !flags.block || i.block === flags.block);
+      if (!pub.length) say('no public addresses.');
+      else table(['ADDRESS', 'USED BY', 'PTR', 'BLOCK', 'FLAGS'], pub.map((i) => [i.address, used(i), i.ptr || `(default ${i.ptr_default})`, i.block || '', i.blacklisted ? 'BLACKLISTED' : '']));
+      if (!flags.public && (r.private || []).length) {
+        say(''); say('private networks:');
+        for (const n of r.private) { say(`  ${n.label}  ${n.cidr}  gateway ${n.gateway || '-'}  router: ${n.router ? n.router.name : 'none yet'}`); for (const p of n.ips) say(`    ${p.address}  ${p.vm_name || (p.database_id ? 'managed database' : '')}${p.router ? '  (router)' : ''}`); }
+      }
+    });
+  }
+  fail('usage: qc ips list [--free] [--block <cidr>] [--public]    every address you hold, across every product (set a PTR with: qc rdns set)');
+}
 // Reverse DNS: list your addresses with their PTRs; set or clear one.
 async function cmdRdns(pos, flags) {
   const sub = (pos.shift() || 'list').toLowerCase();
   if (sub === 'list' || sub === 'ls') {
     const r = await api('GET', '/api/v1/rdns'); const ips = r.ips || [];
-    return emit(r, () => (ips.length ? table(['ADDRESS', 'PTR', 'ON'], ips.map((i) => [i.address + (i.block ? `  (${i.block})` : ''), i.ptr || '—', i.vm_name ? `VM ${i.vm_name}` : i.device_id ? `device #${i.device_id}` : ''])) : say('no public addresses assigned.')));
+    return emit(r, () => (ips.length ? table(['ADDRESS', 'PTR', 'ON'], ips.map((i) => [i.address + (i.block && i.source !== 'block' ? `  (${i.block})` : ''), i.ptr || '—', i.vm_name ? `VM ${i.vm_name}` : i.device_id ? `device #${i.device_id}` : i.source === 'block' ? `block ${i.block}${i.status && i.status !== 'available' ? ` (${i.status})` : ''}` : ''])) : say('no public addresses assigned.')));
   }
   if (sub === 'set') {
     const address = need(pos[0], 'qc rdns set <ip> <hostname> [--colo6]'); const ptr = need(pos[1], 'qc rdns set <ip> <hostname>   (e.g. mail.example.com - and point an A/AAAA record at the IP too)');
@@ -1399,7 +1418,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'ips', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh', 'console'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1412,6 +1431,7 @@ const COMPLETE_SUB = {
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   relay: ['status', 'senders', 'domains', 'log'],
+  ips: ['list'],
   rdns: ['list', 'set', 'clear'],
   web: ['list', 'create', 'quick', 'show', 'deploy', 'put', 'cat', 'rm-file', 'files', 'publish', 'unpublish', 'versions', 'rollback', 'restore', 'preview', 'export', 'domains', 'ai', 'build', 'edit', 'undo', 'forms', 'subscribers', 'widgets', 'rename', 'delete'],
   dns: ['zones', 'add', 'show', 'set', 'rm', 'check', 'export', 'import', 'delete'],
@@ -1478,6 +1498,7 @@ Usage: qc <command> [args] [--json]
   templates                         OS templates you can launch from
   templates <name>                  required inputs for one template
   tiers                             the tiers (clusters) you can build VMs on, with your rates
+  ips list [--free] [--block <cidr>] [--public]  every address you hold across every product + private networks (+ the router)
   rdns list | set <ip> <hostname> | clear <ip>    reverse DNS (PTR) on your public addresses  (--colo6: any address in colo IPv6 space)
 
   vm list                           list your VMs
@@ -1642,6 +1663,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'whoami': case 'workspace': return cmdWhoami();
     case 'templates': return cmdTemplates(pos);
     case 'tiers': case 'clusters': return cmdTiers();
+    case 'ips': case 'ip': return cmdIps(pos, flags);
     case 'rdns': case 'ptr': return cmdRdns(pos, flags);
     case 'vm': return cmdVm(pos, flags);
     case 'net': return cmdNet(pos, flags);

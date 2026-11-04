@@ -51,6 +51,7 @@ qc vm create --name web1 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 \
 qc tiers                        # the tiers you can build on, with your rates (HA vs standard)
 qc vm create --name web2 --vcpu 2 --ram 4 --disk 40 --os ubuntu-24 --tier standard
                                 # no --tier = the default tier, which is the HA one
+qc ips list                     # every address you hold, across every product (+ private networks and their router)
 qc rdns list                    # your public IPs and their reverse DNS (PTR) names
 qc rdns set 203.0.113.10 mail.example.com
 qc rdns clear 203.0.113.10      # back to the pool default
