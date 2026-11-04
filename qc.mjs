@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.9.0';   // 1.9.0: qc ips (every address across every product); 1.8.2: qc rdns list shows the colo/BYO blocks you own; 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.10.0';   // 1.10.0: SSL certificates (qc ssl …); 1.9.0: qc ips (every address across every product); 1.8.2: qc rdns list shows the colo/BYO blocks you own; 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -1359,6 +1359,128 @@ async function cmdRelay(pos, flags) {
 // --- hosted DNS ---------------------------------------------------------------
 // Zones by id or name; record sets are whole-set upserts (Route-53 style), so
 // `qc dns set example.com www A 203.0.113.10 203.0.113.11` replaces the set.
+// --- SSL certificates (/api/v1/ssl) ---------------------------------------------------
+async function cmdSsl(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  const yr = (p, months) => (p.periods || []).find((x) => x.months === months) || null;
+  const perYear = (x) => x.price / (x.months / 12);
+  const saveKey = (key, domain) => {
+    if (!key) return;
+    const out = flags['key-out'] || `${String(domain).replace(/^\*\./, 'wildcard.')}.key`;
+    try { fs.writeFileSync(out, key, { mode: 0o600 }); say(`private key saved to ${out}  (shown ONCE - we keep no copy; the CSR is kept for renewals)`); }
+    catch (e) { say(key); say(`(could not write ${out}: ${e.message} - the key above is NOT stored anywhere else)`); }
+  };
+  const dcvLine = (d) => d.status === 'validated' ? `${d.domain}: validated` : d.automatic ? `${d.domain}: we added the DNS record - waiting for the authority` : d.instructions
+    ? (d.method === 'dns' ? `${d.domain}: add CNAME  ${d.instructions.record_name}  ->  ${d.instructions.record_value}` : d.method === 'email' ? `${d.domain}: approve the email sent to ${d.approver_email}` : `${d.domain}: create ${d.instructions.url} containing:\n      ${String(d.instructions.content || '').replace(/\n/g, '\n      ')}`)
+    : `${d.domain}: ${d.method} - instructions appear once the order reaches the authority`;
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/ssl/certificates'); const certs = r.certificates || [];
+    return emit(r, () => {
+      if (!certs.length) return say(`no certificates.  Order one:  qc ssl catalogue   then   qc ssl order --product <id> --domain <name> … --yes`);
+      table(['ID', 'REF', 'DOMAIN', 'PRODUCT', 'STATUS', 'EXPIRES', 'PAYMENT'], certs.map((c) => [c.id, c.reference, c.domain + (c.sans?.length ? ` +${c.sans.length}` : ''), c.product?.name || '—', c.status.replace('_', ' '), c.validity?.till ? `${c.validity.till} (${c.validity.days_left}d)` : '—', `${c.payment?.method || 'credit'}${c.payment?.invoice_id ? ' #' + c.payment.invoice_id : ''}${c.payment?.paid ? '' : ' unpaid'}`]));
+    });
+  }
+  if (sub === 'catalogue' || sub === 'catalog' || sub === 'products' || sub === 'prices') {
+    const r = await api('GET', '/api/v1/ssl/catalogue'); let list = r.catalogue || [];
+    if (flags.brand) list = list.filter((p) => String(p.brand).toLowerCase() === String(flags.brand).toLowerCase());
+    for (const v of ['dv', 'ov', 'ev']) if (flags[v]) list = list.filter((p) => p.validation === v);
+    if (flags.wildcard) list = list.filter((p) => p.wildcard);
+    return emit(r, () => {
+      table(['ID', 'NAME', 'VAL', 'COVERS', '1 YEAR', 'CHEAPEST/YR', 'TERMS'], list.sort((a, b) => Math.min(...a.periods.map(perYear)) - Math.min(...b.periods.map(perYear))).map((p) => {
+        const one = yr(p, 12) || p.periods[0]; const best = p.periods.reduce((a, x) => (perYear(x) < perYear(a) ? x : a), p.periods[0]);
+        return [p.id, p.name, p.validation.toUpperCase(), p.wildcard ? 'wildcard' : p.multi_domain ? `multi (${p.san_max || 'n'})` : 'one name', money(one.price), `${money(perYear(best))} (${best.months / 12}y)`, p.periods.map((x) => x.months / 12).join('/')];
+      }));
+      say(`\npay: ${(r.payment?.methods || []).join(' or ')} (default ${r.payment?.default_method})  ·  refund window ${r.refund_days} days  ·  keys: ${(r.key_types || []).join(', ')}  ·  prices ex VAT`);
+      say(`quote extras:  qc ssl quote <id> --months 24 [--san n] [--wsan n]     filters: --brand Sectigo --dv|--ov|--ev --wildcard`);
+    });
+  }
+  if (sub === 'quote') {
+    const pid = need(pos[0], 'qc ssl quote <product-id> [--months n] [--san n] [--wsan n]');
+    const r = await api('POST', '/api/v1/ssl/quote', { product_id: +pid, months: +(flags.months || 12), san_count: +(flags.san || 0), wildcard_san_count: +(flags.wsan || 0) });
+    return emit(r, () => { const q = r.quote || {}; for (const l of q.lines || []) say(`  ${l.label}${l.qty > 1 ? ` x${l.qty}` : ''}  ${money(l.price)}`); say(`total ${money(q.price)} once (ex VAT) for ${q.months} months`); });
+  }
+  if (sub === 'approvers') {
+    const d = need(pos[0], 'qc ssl approvers <domain>');
+    const r = await api('GET', `/api/v1/ssl/approver-emails?domain=${encodeURIComponent(d)}`);
+    return emit(r, () => say((r.emails || []).join('\n')));
+  }
+  if (sub === 'order' || sub === 'create' || sub === 'buy') {
+    const usage = 'qc ssl order --product <id> --domain <name> [--san a,b] [--months n] [--dcv auto|dns|http|email] [--approver <email>] [--key rsa2048|rsa4096|ec256 | --csr <file>] --first <n> --last <n> --title <t> --phone <p> --email <e> [--org-name … --org-address … --org-city … --org-postcode … --org-country GB --org-phone … [--org-region …]] [--pay invoice|credit] [--key-out <file>] --yes';
+    for (const k of ['product', 'domain', 'first', 'last', 'title', 'phone', 'email']) if (!flags[k]) fail(`--${k} is required\nusage: ${usage}`);
+    if (!flags.yes) fail('this places a paid order - re-run with --yes');
+    const body = { product_id: +flags.product, domain: flags.domain, months: +(flags.months || 12), sans: flags.san ? String(flags.san).split(',').map((x) => x.trim()).filter(Boolean) : [], dcv_method: flags.dcv || 'auto',
+      contacts: { admin: { firstname: flags.first, lastname: flags.last, title: flags.title, phone: flags.phone, email: flags.email } }, payment: flags.pay || undefined };
+    if (flags.csr) { try { body.csr = fs.readFileSync(flags.csr, 'utf8'); } catch (e) { fail(`cannot read --csr: ${e.message}`); } } else body.key_type = flags.key || 'rsa2048';
+    if (flags.approver) { body.approver_emails = {}; for (const n of [body.domain, ...body.sans]) body.approver_emails[n] = flags.approver; }
+    if (flags['org-name']) body.org = { name: flags['org-name'], addressline1: flags['org-address'], city: flags['org-city'], postalcode: flags['org-postcode'], country: flags['org-country'] || 'GB', phone: flags['org-phone'], region: flags['org-region'] || '' };
+    const r = await api('POST', '/api/v1/ssl/certificates', body, idemKey('ssl-order'));
+    return emit(r, () => {
+      const c = r.certificate || {};
+      say(`${c.reference} ordered: ${c.product?.name} for ${c.domain} - ${c.status.replace('_', ' ')}${r.invoice_id ? ` (invoice #${r.invoice_id} - the certificate is ordered when it is paid)` : ''}`);
+      saveKey(r.private_key, c.domain);
+      for (const d of c.dcv || []) say(`  ${dcvLine(d)}`);
+      say(`watch it:  qc ssl show ${c.id}`);
+    });
+  }
+  const id = need(pos[0], `qc ssl ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/ssl/certificates/${id}`); const c = r.certificate || {};
+    return emit(r, () => {
+      say(`${c.reference}  ${c.domain}${c.sans?.length ? ` +${c.sans.join(', ')}` : ''}  [${c.status.replace('_', ' ')}]`);
+      say(`product : ${c.product?.name} (${String(c.product?.validation || '').toUpperCase()})  ${c.period_months} months  ${money(c.price)}  key ${c.key_type || '—'}`);
+      say(`payment : ${c.payment?.method}${c.payment?.invoice_id ? ` invoice #${c.payment.invoice_id}` : ''} ${c.payment?.paid ? 'paid' : 'UNPAID'}   auto-renew ${c.auto_renew ? 'on' : 'off'}${c.can_cancel ? `   cancel+refund until ${c.refund_until || 'now'}` : ''}`);
+      if (c.validity?.till) say(`valid   : ${c.validity.from} to ${c.validity.till} (${c.validity.days_left} days left)${c.validity.renews_yearly ? `, plan to ${c.validity.subscription_until} - re-issued automatically` : ''}`);
+      say('validation:'); for (const d of c.dcv || []) say(`  ${dcvLine(d)}`);
+      if (c.needs_docs) say(`company vetting: the authority checks the register, phones and emails the contact - answer them directly.${(c.docs || []).length ? ` uploaded: ${c.docs.map((d) => d.filename).join(', ')}` : ''}`);
+      if (c.has_certificate) say(`files   : qc ssl files ${c.id} [--out dir]`);
+      for (const e of (c.events || []).slice(0, 6)) say(`  ${String(e.at || '').slice(0, 16)}  ${e.kind}${e.detail ? ` - ${e.detail}` : ''}`);
+    });
+  }
+  if (sub === 'files' || sub === 'download' || sub === 'bundle') {
+    const r = await api('GET', `/api/v1/ssl/certificates/${id}/bundle`);
+    return emit(r, () => {
+      const dir = flags.out || '.'; const base = String(r.domain || 'certificate').replace(/^\*\./, 'wildcard.').replace(/[^a-z0-9.-]/gi, '_');
+      try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+      for (const [k, ext] of [['certificate', '.crt'], ['chain', '.ca-bundle'], ['bundle', '.fullchain.pem']]) { const f = path.join(dir, base + ext); fs.writeFileSync(f, r[k] || ''); say(`wrote ${f}`); }
+      say('install them with the private key from the order (we never kept it).');
+    });
+  }
+  if (sub === 'recheck' || sub === 'check') { const r = await api('POST', `/api/v1/ssl/certificates/${id}/recheck`, {}); return emit(r, () => { for (const d of r.certificate?.dcv || []) say(dcvLine(d)); }); }
+  if (sub === 'resend') { const r = await api('POST', `/api/v1/ssl/certificates/${id}/resend`, {}); return emit(r, () => say('approval email sent again.')); }
+  if (sub === 'validation' || sub === 'dcv') {
+    const method = flags.method || pos[1]; if (!method) fail('usage: qc ssl validation <id> --method dns|http|email [--domain <name>] [--approver <email>]');
+    const c0 = (await api('GET', `/api/v1/ssl/certificates/${id}`)).certificate || {};
+    const r = await api('POST', `/api/v1/ssl/certificates/${id}/validation`, { domain: flags.domain || c0.domain, method, approver_email: flags.approver });
+    return emit(r, () => { for (const d of r.certificate?.dcv || []) say(dcvLine(d)); });
+  }
+  if (sub === 'autorenew' || sub === 'auto-renew') { const on = (pos[1] || '').toLowerCase(); if (!['on', 'off'].includes(on)) fail('usage: qc ssl autorenew <id> on|off'); const r = await api('PUT', `/api/v1/ssl/certificates/${id}/auto-renew`, { auto_renew: on === 'on' }); return emit(r, () => say(`auto-renew ${on} (renewals are paid from Cloud Credit).`)); }
+  if (sub === 'reissue') {
+    if (!flags.yes) fail('re-issuing makes a NEW key; the old certificate stops being valid once you install the new one - re-run with --yes');
+    const body = {}; if (flags.csr) { try { body.csr = fs.readFileSync(flags.csr, 'utf8'); } catch (e) { fail(`cannot read --csr: ${e.message}`); } } else body.key_type = flags.key || 'rsa2048';
+    const r = await api('POST', `/api/v1/ssl/certificates/${id}/reissue`, body);
+    return emit(r, () => { say('re-issue requested - validate the domain again if asked; new files replace the old ones when issued.'); saveKey(r.private_key, r.certificate?.domain || id); for (const d of r.certificate?.dcv || []) say(`  ${dcvLine(d)}`); });
+  }
+  if (sub === 'renew') {
+    if (!flags.yes) fail('renewing places a new paid order - re-run with --yes   [--pay invoice|credit] [--key <type> for a new key, else the current key is kept]');
+    const body = { payment: flags.pay || undefined, months: flags.months ? +flags.months : undefined }; if (flags.key) body.key_type = flags.key; if (flags.csr) { try { body.csr = fs.readFileSync(flags.csr, 'utf8'); } catch (e) { fail(`cannot read --csr: ${e.message}`); } }
+    const r = await api('POST', `/api/v1/ssl/certificates/${id}/renew`, body, idemKey('ssl-renew'));
+    return emit(r, () => { const c = r.certificate || {}; say(`renewal ${c.reference} placed - ${c.status.replace('_', ' ')}${r.invoice_id ? ` (invoice #${r.invoice_id})` : ''}`); saveKey(r.private_key, c.domain); });
+  }
+  if (sub === 'cancel') {
+    if (!flags.yes) fail('usage: qc ssl cancel <id> [--refund credit|invoice] --yes   (refund lands when the authority confirms, ~2 days)');
+    const r = await api('POST', `/api/v1/ssl/certificates/${id}/cancel`, { refund: flags.refund || 'credit' });
+    return emit(r, () => say(`${r.certificate?.reference} is ${String(r.certificate?.status || '').replace('_', ' ')}.`));
+  }
+  if (sub === 'docs' || sub === 'upload') {
+    const file = need(pos[1], 'qc ssl docs <id> <file.pdf|png|jpg>');
+    let buf; try { buf = fs.readFileSync(file); } catch (e) { fail(`cannot read ${file}: ${e.message}`); }
+    const mime = /\.pdf$/i.test(file) ? 'application/pdf' : /\.png$/i.test(file) ? 'image/png' : 'image/jpeg';
+    const r = await api('POST', `/api/v1/ssl/certificates/${id}/docs`, { filename: path.basename(file), data: `data:${mime};base64,${buf.toString('base64')}` });
+    return emit(r, () => say(`uploaded ${r.file?.filename} - we pass it to the authority if they ask for it through us.`));
+  }
+  fail('usage: qc ssl list|catalogue|quote|approvers|order|show|files|recheck|resend|validation|autorenew|reissue|renew|cancel|docs   (qc help for details)');
+}
+
 async function cmdDns(pos, flags) {
   const sub = (pos.shift() || 'zones').toLowerCase();
   if (sub === 'zones' || sub === 'list' || sub === 'ls') {
@@ -1418,7 +1540,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'ips', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'ips', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'ssl', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh', 'console'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1429,6 +1551,7 @@ const COMPLETE_SUB = {
   fw: ['list', 'sizes', 'create', 'show', 'rename', 'set', 'rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels', 'reboot', 'update', 'traffic', 'delete'],
   lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
+  ssl: ['list', 'catalogue', 'quote', 'approvers', 'order', 'show', 'files', 'recheck', 'resend', 'validation', 'autorenew', 'reissue', 'renew', 'cancel', 'docs'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   relay: ['status', 'senders', 'domains', 'log'],
   ips: ['list'],
@@ -1588,6 +1711,18 @@ Usage: qc <command> [args] [--json]
   box keys <id> list|set <key-id…>|set --none          key-based SFTP (panel key manager ids)
   box delete <id> --yes
 
+  ssl list | catalogue [--brand b --dv|--ov|--ev --wildcard]     your certificates / every product with 1-year and cheapest-per-year prices
+  ssl quote <product-id> [--months n] [--san n] [--wsan n]      price before ordering
+  ssl order --product <id> --domain <name> [--san a,b] [--months n] [--dcv auto|dns|http|email] [--approver e]
+            [--key rsa2048|rsa4096|ec256 | --csr <file>] --first --last --title --phone --email [--org-name … (OV/EV)] [--pay invoice|credit] [--key-out f] --yes
+                                    private key written ONCE to <domain>.key (we keep no copy; the CSR is kept for renewals)
+  ssl show <id>                     status, validation steps (the exact record / file / email), payment, files
+  ssl files <id> [--out dir]        certificate, CA chain and full chain as PEM files
+  ssl recheck <id> | resend <id> | validation <id> --method dns|http|email [--approver e]
+  ssl autorenew <id> on|off         renewals paid from credit, 30 days before expiry
+  ssl renew <id> [--pay …] [--key t] --yes    reissue <id> [--key t | --csr f] --yes    cancel <id> [--refund credit|invoice] --yes
+  ssl docs <id> <file>              company document for an OV/EV order (only if the authority asks for it through us)
+
   db list | sizes                   your database instances / engines, sizes with all-in prices
   db create --label <n> --engine postgres|mariadb|valkey [--size s] (--allow <cidr,…> | --network <id>) [--database d] [--ha] --yes
                                     builds dedicated server(s), bills hourly; admin password printed ONCE
@@ -1674,6 +1809,7 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'fw': case 'firewall': return cmdFw(pos, flags);
     case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
     case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
+    case 'ssl': case 'cert': case 'certs': case 'certificates': return cmdSsl(pos, flags);
     case 'db': case 'database': case 'databases': return cmdDb(pos, flags);
     case 'relay': case 'smtp': return cmdRelay(pos, flags);
     case 'web': case 'site': case 'websites': return cmdWeb(pos, flags);
