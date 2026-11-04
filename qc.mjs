@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.10.0';   // 1.10.0: SSL certificates (qc ssl …); 1.9.0: qc ips (every address across every product); 1.8.2: qc rdns list shows the colo/BYO blocks you own; 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
+const VERSION = '1.11.0';   // 1.11.0: App Hosting (qc app …) + Magento staging/push (qc shop …); 1.10.0: SSL certificates (qc ssl …); 1.9.0: qc ips (every address across every product); 1.8.2: qc rdns list shows the colo/BYO blocks you own; 1.8.1: qc tiers + vm create --tier/--storage + qc rdns + qc vm console; 1.8.0: websites + the AI builder (qc web …); 1.7.0: SMTP relay; 1.6.0: managed databases; 1.5.0: storage boxes; 1.4.0: load balancers; 1.3.x: Cloud Firewall + qc update; 1.2.0: dedicated + DNS
 const DEFAULT_URL = 'https://cloud.quickhost.uk';   // (the panel pre-fills this on download)
 const CFG_DIR = path.join(os.homedir(), '.config', 'quickcloud');
 const CFG_FILE = path.join(CFG_DIR, 'config.json');
@@ -1481,6 +1481,129 @@ async function cmdSsl(pos, flags) {
   fail('usage: qc ssl list|catalogue|quote|approvers|order|show|files|recheck|resend|validation|autorenew|reissue|renew|cancel|docs   (qc help for details)');
 }
 
+// --- App Hosting (/api/v1/apps) ----------------------------------------------------------
+async function cmdApp(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  const kv = (list) => (list || []).map((x) => { const i = x.indexOf('='); return i > 0 ? { key: x.slice(0, i), value: x.slice(i + 1) } : null; }).filter(Boolean);
+  const sayApp = (a) => {
+    say(`#${a.id}  ${a.name}  [${a.state}]  ${a.url || a.hostname || ''}`);
+    if (a.repo) say(`repo    : ${a.repo.url}  branch ${a.repo.branch}  ${a.repo.kind}  ${a.repo.autodeploy ? 'auto-deploy on push' : 'manual deploys'}  build ${a.repo.build_mode}`);
+    if (a.size) say(`size    : ${a.size.label || a.size.slug}${a.size.vcpu_milli ? ` (${a.size.vcpu_milli / 1000} vCPU, ${a.size.ram_mb} MB)` : ''}${a.cost ? `  ${money(a.cost.hourly)}/h, max ${money(a.cost.monthly_max)}/mo` : ''}`);
+    if (a.runtime) say(`runtime : port ${a.runtime.port}  health ${a.runtime.health_path}${a.runtime.start_cmd ? `  start "${a.runtime.start_cmd}"` : ''}`);
+    if (a.volume) say(`volume  : ${a.volume.path}  ${a.volume.size_gb} GB${a.volume.used_bytes != null ? ` (${(a.volume.used_bytes / 1048576).toFixed(0)} MB used)` : ''}`);
+    if (a.health) say(`health  : ${a.health.state}  restarts ${a.health.restarts}${a.health.cpu_pct != null ? `  cpu ${a.health.cpu_pct}%` : ''}${a.health.mem_bytes != null ? `  mem ${(a.health.mem_bytes / 1048576).toFixed(0)} MB` : ''}`);
+    if ((a.env || []).length) say(`env     : ${a.env.map((e) => `${e.key}${e.secret ? ' (secret)' : '=' + e.value}${e.build_arg ? ' [build]' : ''}`).join('  ')}`);
+    for (const d of a.domains || []) say(`domain  : ${d.domain}  ${d.verified ? 'verified' : `UNVERIFIED - CNAME ${d.verify_cname}  or TXT ${d.verify_txt?.name} = ${d.verify_txt?.value}${d.apex_addresses?.v4 ? `  (apex: A ${d.apex_addresses.v4})` : ''}`}`);
+    for (const b of (a.builds || []).slice(0, 5)) say(`build   : #${b.id}  ${b.status}${b.commit_sha ? `  ${String(b.commit_sha).slice(0, 7)}` : ''}  ${b.created_at || ''}`);
+  };
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/apps'); const apps = r.apps || [];
+    return emit(r, () => {
+      if (!apps.length) return say(`no apps.  Deploy one:  qc app create --name api --repo https://github.com/you/api --size s --yes   (see  qc app sizes)`);
+      table(['ID', 'NAME', 'STATE', 'SIZE', 'URL', 'VOLUME', '£/H'], apps.map((a) => [a.id, a.name, a.state, a.size?.slug || '—', a.url || a.hostname || '—', a.volume ? `${a.volume.size_gb}G` : '—', a.cost ? a.cost.hourly.toFixed(4) : '—']));
+    });
+  }
+  if (sub === 'sizes') { const r = await api('GET', '/api/v1/apps'); return emit(r, () => table(['SLUG', 'LABEL', 'VCPU', 'RAM', '£/H', 'MAX £/MO'], (r.sizes || []).map((z) => [z.slug, z.label, z.vcpu_milli != null ? z.vcpu_milli / 1000 : '—', z.ram_mb != null ? `${z.ram_mb}M` : '—', z.hourly != null ? z.hourly.toFixed(4) : (z.price_hr ?? '—'), z.monthly_max != null ? money(z.monthly_max) : '—']))); }
+  if (sub === 'create' || sub === 'new') {
+    const usage = 'qc app create --name <n> --repo <url|owner/repo> [--branch main] [--size s] [--volume <GB> [--volume-path /data]] [--env K=V …] [--port 8080] [--health /] [--dockerfile] [--base-dir d] [--start "cmd"] [--no-deploy] --yes';
+    if (!flags.name || !flags.repo) fail(`usage: ${usage}`);
+    if (!flags.yes) fail('an app bills hourly while it runs - re-run with --yes');
+    const body = { name: flags.name, repo_url: flags.repo, repo_kind: flags.github ? 'github_app' : 'public', branch: flags.branch || 'main', size: flags.size, build_mode: flags.dockerfile ? 'dockerfile' : 'auto', deploy: !flags['no-deploy'] };
+    if (flags.volume) { body.volume_gb = +flags.volume; body.volume_path = flags['volume-path'] || '/data'; }
+    if (flags.port) body.port = +flags.port; if (flags.health) body.health_path = flags.health; if (flags['base-dir']) body.base_dir = flags['base-dir']; if (flags.start) body.start_cmd = flags.start;
+    const envs = kv([].concat(flags.env || [])); if (envs.length) body.env = envs;
+    const r = await api('POST', '/api/v1/apps', body, idemKey('app-create'));
+    return emit(r, () => { const a = r.app || {}; say(`app #${a.id} ${a.name} created - ${a.state}${r.build_id ? ` (build #${r.build_id})` : ''}.  https://${a.hostname}/ once the build succeeds.`); say(`follow it:  qc app show ${a.id}   ·   qc app build ${a.id} ${r.build_id || '<build-id>'}`); });
+  }
+  const id = need(pos[0], `qc app ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') { const r = await api('GET', `/api/v1/apps/${id}`); return emit(r, () => sayApp(r.app || {})); }
+  if (sub === 'deploy' || sub === 'redeploy') { const r = await api('POST', `/api/v1/apps/${id}/deploy`, { trigger: sub === 'redeploy' ? 'redeploy' : 'manual' }); return emit(r, () => say(`build #${r.build_id} started - the new version takes over once it answers its health check.  qc app build ${id} ${r.build_id}`)); }
+  if (sub === 'build' || sub === 'log' || sub === 'logs') { const bid = need(pos[1], `qc app ${sub} <id> <build-id>`); const r = await api('GET', `/api/v1/apps/${id}/builds/${bid}`); return emit(r, () => { const b = r.build || {}; say(`build #${b.id}  ${b.status}  ${b.trigger}  ${b.commit_sha || ''}  ${b.created_at || ''} → ${b.finished_at || '…'}`); if (b.log) say(b.log); }); }
+  if (sub === 'start' || sub === 'stop') { const r = await api('POST', `/api/v1/apps/${id}/${sub}`, {}); return emit(r, () => say(`app #${id}: ${r.app?.state}`)); }
+  if (sub === 'resize') { const size = need(flags.size || pos[1], 'qc app resize <id> --size <slug>'); const r = await api('POST', `/api/v1/apps/${id}/resize`, { size }); return emit(r, () => say(`app #${id} → size ${r.app?.size?.slug} (${r.app?.state})`)); }
+  if (sub === 'set' || sub === 'config') {
+    const body = {}; for (const k of ['name', 'branch', 'base_dir', 'build_mode', 'dockerfile_path', 'start_cmd', 'health_path']) { const f = k.replace(/_/g, '-'); if (flags[f] !== undefined) body[k] = flags[f] === 'null' ? null : flags[f]; }
+    if (flags.port) body.port = +flags.port; if (flags.autodeploy !== undefined) body.autodeploy = flags.autodeploy !== 'off' && flags.autodeploy !== 'false';
+    if (!Object.keys(body).length) fail('usage: qc app set <id> [--name n] [--branch b] [--base-dir d|null] [--build-mode auto|dockerfile] [--dockerfile-path p] [--start-cmd "c"|null] [--health-path /] [--port n] [--autodeploy on|off]');
+    const r = await api('PATCH', `/api/v1/apps/${id}`, body); return emit(r, () => sayApp(r.app || {}));
+  }
+  if (sub === 'env') {
+    const act = (pos[1] || 'list').toLowerCase();
+    const owned = new Set(((await api('GET', `/api/v1/apps/${id}/database-connections`)).connections || []).flatMap((c) => c.env_keys || [c.env_key]).filter(Boolean));   // set by database connections - never sent back
+    const cur = ((await api('GET', `/api/v1/apps/${id}`)).app?.env || []).filter((e) => !owned.has(e.key));
+    const keepAll = (list) => list.map((e) => ({ key: e.key, value: e.secret ? '' : (e.value ?? ''), secret: !!e.secret, build_arg: !!e.build_arg }));   // '' + secret = keep the stored secret
+    if (act === 'list') return emit({ env: cur }, () => (cur.length ? table(['KEY', 'VALUE', 'FLAGS'], cur.map((e) => [e.key, e.secret ? '(secret)' : e.value, [e.secret ? 'secret' : '', e.build_arg ? 'build' : ''].filter(Boolean).join(',')])) : say('no variables.')));
+    if (act === 'set') { const add = kv(pos.slice(2)); if (!add.length) fail('usage: qc app env <id> set K=V [K=V…] [--secret] [--build]'); const next = keepAll(cur.filter((e) => !add.some((n) => n.key === e.key))); for (const n of add) next.push({ key: n.key, value: n.value, secret: !!flags.secret, build_arg: !!flags.build }); const r = await api('PUT', `/api/v1/apps/${id}/env`, { env: next }); return emit(r, () => say(`${add.length} set - redeploy to apply:  qc app deploy ${id}`)); }
+    if (act === 'rm' || act === 'unset') { const keys = pos.slice(2); if (!keys.length) fail('usage: qc app env <id> rm KEY [KEY…]'); const r = await api('PUT', `/api/v1/apps/${id}/env`, { env: keepAll(cur.filter((e) => !keys.includes(e.key))) }); return emit(r, () => say(`removed - redeploy to apply:  qc app deploy ${id}`)); }
+    fail('usage: qc app env <id> list|set K=V…|rm KEY…');
+  }
+  if (sub === 'volume' || sub === 'storage') { const gb = need(flags.size || flags.gb || pos[1], 'qc app volume <id> <GB> [--path /data]   (grows, never shrinks)'); const r = await api('PUT', `/api/v1/apps/${id}/storage`, { size_gb: +gb, path: flags.path }); return emit(r, () => say(`volume: ${r.app?.volume?.path} ${r.app?.volume?.size_gb} GB`)); }
+  if (sub === 'rollback') { const img = need(flags.image || pos[1], 'qc app rollback <id> <image-id> --yes'); if (!flags.yes) fail('rollback switches the running version - re-run with --yes'); const r = await api('POST', `/api/v1/apps/${id}/rollback`, { image_id: +img }); return emit(r, () => say(`rolling back to image #${r.app?.live_image?.id} (${r.app?.state})`)); }
+  if (sub === 'domains' || sub === 'domain') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/apps/${id}`); return emit({ domains: r.app?.domains || [] }, () => sayApp({ id, name: r.app?.name, state: r.app?.state, domains: r.app?.domains })); }
+    if (act === 'add') { const d = need(pos[2], 'qc app domains <id> add <domain>'); const r = await api('POST', `/api/v1/apps/${id}/domains`, { domain: d }); return emit(r, () => { for (const x of r.app?.domains || []) if (x.domain === d) say(`added ${d}: point it with CNAME ${x.verify_cname}  (or TXT ${x.verify_txt?.name} = ${x.verify_txt?.value}${x.apex_addresses?.v4 ? ` + A ${x.apex_addresses.v4}` : ''}), then  qc app domains ${id} verify ${x.id}`); }); }
+    if (act === 'verify') { const did = need(pos[2], 'qc app domains <id> verify <domain-id>'); const r = await api('POST', `/api/v1/apps/${id}/domains/${did}/verify`, {}); return emit(r, () => say(r.verified ? 'verified - HTTPS follows shortly.' : 'not verified yet - DNS may still be propagating.')); }
+    if (act === 'rm' || act === 'delete') { const did = need(pos[2], 'qc app domains <id> rm <domain-id>'); const r = await api('DELETE', `/api/v1/apps/${id}/domains/${did}`); return emit(r, () => say('removed.')); }
+    fail('usage: qc app domains <id> list|add <domain>|verify <domain-id>|rm <domain-id>');
+  }
+  if (sub === 'db' || sub === 'database' || sub === 'databases') {
+    const act = (pos[1] || 'list').toLowerCase();
+    if (act === 'list') { const r = await api('GET', `/api/v1/apps/${id}/database-connections`); return emit(r, () => ((r.connections || []).length ? table(['ID', 'DATABASE', 'ENGINE', 'SQL DB', 'USER', 'STATUS', 'ENV'], r.connections.map((c) => [c.id, c.database?.label, c.database?.engine, c.sql_database || '—', c.user, c.status, (c.env_keys || [c.env_key]).join(',')])) : say('no database connections.  qc app db <id> connect <database-id>'))); }
+    if (act === 'connect' || act === 'add') { const dbid = need(pos[2], 'qc app db <id> connect <database-id> [--sql-database name | --create name] [--env-key DATABASE_URL]'); const body = { database_id: +dbid }; if (flags['sql-database']) body.sql_database = flags['sql-database']; if (flags.create) body.create_database = flags.create; if (flags['env-key']) body.env_key = flags['env-key']; const r = await api('POST', `/api/v1/apps/${id}/database-connections`, body); return emit(r, () => say(`connection #${r.connection?.id} ${r.connection?.status} - ${(r.connection?.env_keys || []).join(', ')} will be in the app environment on the next deploy.`)); }
+    if (act === 'rotate') { const cid = need(pos[2], 'qc app db <id> rotate <connection-id>'); const r = await api('POST', `/api/v1/apps/${id}/database-connections/${cid}/rotate`, {}); return emit(r, () => say('password rotating - the app restarts with the new one.')); }
+    if (act === 'rm' || act === 'disconnect') { const cid = need(pos[2], 'qc app db <id> rm <connection-id>'); const r = await api('DELETE', `/api/v1/apps/${id}/database-connections/${cid}`); return emit(r, () => say('disconnected; the database user was revoked.')); }
+    fail('usage: qc app db <id> list|connect <database-id> [--create name]|rotate <cid>|rm <cid>');
+  }
+  if (sub === 'delete' || sub === 'rm') { if (!flags.yes) fail('this deletes the app AND its volume - re-run with --yes'); const r = await api('DELETE', `/api/v1/apps/${id}`, undefined, idemKey('app-delete')); return emit(r, () => say(`app #${id} deleted.`)); }
+  fail('usage: qc app list|sizes|create|show|deploy|build|start|stop|resize|set|env|volume|rollback|domains|db|delete   (qc help for details)');
+}
+
+// --- Magento Hosting (/api/v1/shops): stores (read), staging copies, push-to-live ---------------
+async function cmdShop(pos, flags) {
+  const sub = (pos.shift() || 'list').toLowerCase();
+  const stg = (s) => (s && s.staging) || {};
+  if (sub === 'list' || sub === 'ls') {
+    const r = await api('GET', '/api/v1/shops'); const shops = r.shops || [];
+    return emit(r, () => {
+      if (!shops.length) return say('no Magento stores (stores are created in the panel).');
+      table(['ID', 'LABEL', 'HEALTH', 'SIZE', 'URL', 'STAGING', 'PUSH', '£/H'], shops.map((s) => [s.id, s.label, s.health, s.size?.label || s.size?.slug || '—', s.url || '—', stg(s).state || 'none', s.push?.state || (s.push?.can ? 'ready' : '—'), s.cost ? s.cost.hourly.toFixed(4) : '—']));
+    });
+  }
+  const id = need(pos[0], `qc shop ${sub} <id>`);
+  if (sub === 'show' || sub === 'get') {
+    const r = await api('GET', `/api/v1/shops/${id}`); const s = r.shop || {}; const g = stg(s);
+    return emit(r, () => {
+      say(`#${s.id}  ${s.label}  [${s.health}]  ${s.url || ''}  ${s.size?.label || ''}${s.cost ? `  ${money(s.cost.hourly)}/h max ${money(s.cost.monthly_max)}/mo` : ''}`);
+      say(`staging : ${g.state || 'none'}${g.step ? ` (${g.step})` : ''}${g.url ? `  ${g.url}` : ''}${g.customer_data ? `  customer data ${g.customer_data}` : ''}${g.egress ? `  egress ${g.egress}` : ''}${g.live_changed ? '  LIVE CODE CHANGED since the copy' : ''}`);
+      if (g.fit) say(`fit     : ${g.fit.text || (g.fit.ok ? 'ok' : 'no room')}`);
+      if (g.access) say(`access  : ${g.access.length ? g.access.join(', ') + ' skip the password' : 'password only'}`);
+      if (g.sftp) say(`sftp    : ${g.sftp.available ? `${g.sftp.user}@${g.sftp.host}:${g.sftp.port}  keys ${(g.sftp.keys || []).map((k) => k.label).join(', ') || 'none'}` : 'off'}`);
+      if (g.commands) say(`command : ${g.commands.state} ${g.commands.kind || ''}`);
+      if (g.backups) say(`backups : ${(g.backups.sets || []).length} set(s)${g.backups.running ? ' - one running' : ''}`);
+      if (s.push) say(`push    : ${s.push.state || (s.push.can ? 'ready' : 'not available')}${s.push.db_upgraded ? '  (database upgraded)' : ''}${s.push.can_undo ? `  undo until ${s.push.undo_until}` : ''}`);
+    });
+  }
+  if (sub === 'staging' || sub === 'stg') {
+    const act = (pos[1] || 'show').toLowerCase();
+    const P = (path, body) => api('POST', `/api/v1/shops/${id}/staging${path}`, body || {});
+    if (act === 'create' || act === 'refresh') { if (!flags.yes) fail(`a staging copy uses the store's own disk and memory${act === 'refresh' ? ' and REPLACES the current copy (its changes are lost)' : ''} - re-run with --yes`); const r = await P('', { source: flags.source || 'last', keep_customer_data: !!flags['keep-customer-data'], refresh: act === 'refresh' }); return emit(r, () => say(`staging ${stg(r.shop).state} - follow with  qc shop show ${id}`)); }
+    if (act === 'delete' || act === 'rm') { if (!flags.yes) fail('deletes the staging copy - re-run with --yes'); const r = await api('DELETE', `/api/v1/shops/${id}/staging`); return emit(r, () => say('staging copy deleting.')); }
+    if (act === 'password') { const r = await P(flags.new ? '/password/new' : '/password'); return emit(r, () => say(`${r.url}\nuser ${r.user}  password ${r.password}`)); }
+    if (act === 'access') { const r = await api('PUT', `/api/v1/shops/${id}/staging/access`, { cidrs: pos.slice(2) }); return emit(r, () => say(`skip the password from: ${(stg(r.shop).access || []).join(', ') || 'nowhere'}`)); }
+    if (act === 'egress') { const mode = need(pos[2], 'qc shop staging <id> egress blocked|open'); const r = await api('PUT', `/api/v1/shops/${id}/staging/egress`, { mode }); return emit(r, () => say(`staging egress ${stg(r.shop).egress}`)); }
+    if (act === 'sftp') { const ids = pos.slice(2).map(Number).filter(Number.isInteger); const r = await api('PUT', `/api/v1/shops/${id}/staging/sftp`, { key_ids: flags.off ? [] : ids, cidrs: flags.cidr ? String(flags.cidr).split(',') : undefined }); return emit(r, () => { const f = stg(r.shop).sftp || {}; say(f.available ? `sftp ${f.user}@${f.host} -p ${f.port}` : 'sftp off'); }); }
+    if (act === 'backup') { const r = await P('/backup'); return emit(r, () => say('staging backup started.')); }
+    if (act === 'flush' || act === 'reindex' || act === 'upgrade') { const r = await P('/command', { kind: act }); return emit(r, () => say(`${act} running on staging - qc shop show ${id}`)); }
+    if (act === 'admin') { const r = await P('/admin-login'); return emit(r, () => say(`${r.url}\nuser ${r.user}  password ${r.password}${r.tfa_key ? `\n2FA key ${r.tfa_key}` : ''}  (shown ONCE)`)); }
+    if (act === 'show') return cmdShop(['show', id], flags);
+    fail('usage: qc shop staging <id> create|refresh [--source last|fresh|<backup-id>] [--keep-customer-data] --yes | delete --yes | password [--new] | access [cidr…] | egress blocked|open | sftp <key-id…>|--off [--cidr a,b] | backup | flush|reindex|upgrade | admin');
+  }
+  if (sub === 'push') { if (!flags.yes) fail('push copies staging CODE to the live store - re-run with --yes  [--media] [--confirm-live-changed]'); const r = await api('POST', `/api/v1/shops/${id}/push`, { media: !!flags.media, confirm_live_changed: !!flags['confirm-live-changed'] }, idemKey('shop-push')); return emit(r, () => say(`push ${r.shop?.push?.state} - qc shop show ${id}`)); }
+  if (sub === 'undo' || sub === 'push-undo') { if (!flags.yes) fail('puts the code from before the last push back - re-run with --yes'); const r = await api('POST', `/api/v1/shops/${id}/push/undo`, {}, idemKey('shop-undo')); return emit(r, () => say(`push ${r.shop?.push?.state}`)); }
+  fail('usage: qc shop list|show|staging|push|undo   (qc help for details)');
+}
+
 async function cmdDns(pos, flags) {
   const sub = (pos.shift() || 'zones').toLowerCase();
   if (sub === 'zones' || sub === 'list' || sub === 'ls') {
@@ -1540,7 +1663,7 @@ function need(v, usage) { if (v == null || v === '') fail(`usage: ${usage}`); re
 // --- shell tab completion ---------------------------------------------------
 // `qc completion bash|zsh` prints a snippet that delegates back to
 // `qc __complete <cword> <words…>`, so completion always tracks the command tree.
-const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'ips', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'ssl', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
+const COMPLETE_TOP = ['config', 'whoami', 'templates', 'tiers', 'ips', 'rdns', 'vm', 'net', 'snap', 'backup', 'preset', 'dedi', 'fw', 'lb', 'box', 'ssl', 'app', 'shop', 'db', 'relay', 'web', 'dns', 'job', 'reseller', 'update', 'completion', 'help', 'version'];
 const COMPLETE_SUB = {
   vm: ['list', 'show', 'create', 'start', 'stop', 'shutdown', 'reboot', 'rename', 'resize', 'delete', 'wait', 'ssh', 'console'],
   net: ['list', 'create', 'free-ips', 'attach', 'detach', 'rm'],
@@ -1551,6 +1674,8 @@ const COMPLETE_SUB = {
   fw: ['list', 'sizes', 'create', 'show', 'rename', 'set', 'rules', 'forwards', 'vpn', 'lans', 'wan', 'nat1', 'tunnels', 'reboot', 'update', 'traffic', 'delete'],
   lb: ['list', 'info', 'create', 'show', 'rename', 'listeners', 'backends', 'domains', 'delete'],
   box: ['list', 'plans', 'create', 'show', 'password', 'resize', 'mode', 'snap', 'allow', 'keys', 'delete'],
+  app: ['list', 'sizes', 'create', 'show', 'deploy', 'build', 'start', 'stop', 'resize', 'set', 'env', 'volume', 'rollback', 'domains', 'db', 'delete'],
+  shop: ['list', 'show', 'staging', 'push', 'undo'],
   ssl: ['list', 'catalogue', 'quote', 'approvers', 'order', 'show', 'files', 'recheck', 'resend', 'validation', 'autorenew', 'reissue', 'renew', 'cancel', 'docs'],
   db: ['list', 'sizes', 'create', 'show', 'rename', 'admin-password', 'start', 'stop', 'shutdown', 'reboot', 'switchover', 'logs', 'recovery', 'alerts', 'ca', 'users', 'databases', 'adopt', 'set', 'allow', 'backup', 'restore', 'recover', 'delete'],
   relay: ['status', 'senders', 'domains', 'log'],
@@ -1723,6 +1848,21 @@ Usage: qc <command> [args] [--json]
   ssl renew <id> [--pay …] [--key t] --yes    reissue <id> [--key t | --csr f] --yes    cancel <id> [--refund credit|invoice] --yes
   ssl docs <id> <file>              company document for an OV/EV order (only if the authority asks for it through us)
 
+  app list | sizes                  your apps / sizes with hourly and capped monthly prices
+  app create --name <n> --repo <url|owner/repo> [--branch b] [--size s] [--volume GB] [--env K=V…] [--port n] [--dockerfile] --yes
+  app show <id> | deploy <id> | build <id> <build-id>      detail / build now / build log
+  app start|stop <id>  ·  resize <id> --size s  ·  set <id> [--branch b --port n --autodeploy on|off …]
+  app env <id> list|set K=V… [--secret] [--build]|rm KEY…     (redeploy to apply)
+  app volume <id> <GB> [--path /data]  ·  rollback <id> <image-id> --yes
+  app domains <id> list|add <domain>|verify <did>|rm <did>
+  app db <id> list|connect <database-id> [--create name]|rotate <cid>|rm <cid>     managed-database connections → env
+  app delete <id> --yes
+
+  shop list | show <id>             your Magento stores (created in the panel), staging + push state
+  shop staging <id> create|refresh [--source last|fresh|<backup-id>] [--keep-customer-data] --yes
+  shop staging <id> password [--new] | access [cidr…] | egress blocked|open | sftp <key-id…>|--off | backup | flush|reindex|upgrade | admin | delete --yes
+  shop push <id> [--media] [--confirm-live-changed] --yes      staging code → live;   shop undo <id> --yes
+
   db list | sizes                   your database instances / engines, sizes with all-in prices
   db create --label <n> --engine postgres|mariadb|valkey [--size s] (--allow <cidr,…> | --network <id>) [--database d] [--ha] --yes
                                     builds dedicated server(s), bills hourly; admin password printed ONCE
@@ -1810,6 +1950,8 @@ const cmd = (pos.shift() || 'help').toLowerCase();
     case 'lb': case 'loadbalancer': return cmdLb(pos, flags);
     case 'box': case 'storagebox': case 'storage': return cmdBox(pos, flags);
     case 'ssl': case 'cert': case 'certs': case 'certificates': return cmdSsl(pos, flags);
+    case 'app': case 'apps': return cmdApp(pos, flags);
+    case 'shop': case 'shops': case 'magento': return cmdShop(pos, flags);
     case 'db': case 'database': case 'databases': return cmdDb(pos, flags);
     case 'relay': case 'smtp': return cmdRelay(pos, flags);
     case 'web': case 'site': case 'websites': return cmdWeb(pos, flags);

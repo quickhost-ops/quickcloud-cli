@@ -232,6 +232,31 @@ qc box delete 12 --yes
 Snapshots are read-only under `/.zfs/snapshot/<name>/` on the box itself - restore
 by copying files back over SFTP.
 
+**SSL certificates** (Sectigo, DigiCert, GeoTrust, Thawte, RapidSSL and GoGetSSL at one
+simple price - single name, wildcard or multi-domain, 1 to 6 years). Ordering, renewing and
+cancelling spend money, so the key needs the `billing` role; the rest works with `operator`:
+
+```sh
+qc ssl catalogue --dv                         # every product: 1-year price + cheapest per year
+qc ssl quote 58 --months 24                   # price before ordering (ex VAT)
+qc ssl order --product 58 --domain shop.example.com --dcv auto \
+  --first Jane --last Doe --title Owner --phone "+44 1234 567890" --email jane@example.com \
+  --pay invoice --yes                         # private key written ONCE to shop.example.com.key
+qc ssl show 5                                 # status + the exact DNS record / file / email still needed
+qc ssl recheck 5                              # ask the authority to look again
+qc ssl files 5 --out ./certs                  # .crt, .ca-bundle and .fullchain.pem once issued
+qc ssl autorenew 5 on                         # paid from credit 30 days before expiry
+qc ssl renew 5 --yes                          # same key by default (the CSR is kept for you)
+qc ssl reissue 5 --key ec256 --yes            # lost key: new key, free, shown once
+qc ssl cancel 5 --refund credit --yes         # within the refund window; lands when the authority confirms
+```
+
+Domains on your Smart DNS validate automatically - the CNAME is added for you. `--pay
+invoice` emails a WHMCS invoice and places the order when it is paid; `--pay credit`
+takes it from Cloud Credit now. OV/EV products take `--org-name … --org-address …
+--org-city … --org-postcode … --org-country GB --org-phone …`; the certificate authority
+then vets the company directly (register check, phone call, email to the contact).
+
 **Managed databases** (PostgreSQL / MariaDB / Valkey on dedicated resources,
 optionally a 3-node HA cluster). An instance is real servers billing hourly from
 the moment it exists, so `create` and `restore` are `--yes` gated and idempotent;
@@ -277,6 +302,44 @@ up a run comes out of your credit and `qc` refuses unless you pass
 `--accept-charge` (the prices are printed first), so a script never spends money
 it did not know about. A key limited to one site can edit, build and publish
 that site but never create or delete sites - the right key for a deploy bot.
+
+**App Hosting** (git repository in, running container out - built on an isolated build
+server, served behind HTTPS at `<name>.quickapp.uk`, new versions switch only once they
+pass their health check). Creating, resizing and volumes spend credit (`billing` role);
+deploys, env and domains are `operator`:
+
+```sh
+qc app sizes                                  # sizes with hourly and capped monthly prices
+qc app create --name api --repo https://github.com/acme/api --size s --volume 5 --yes
+qc app create --name web --repo acme/web --github --dockerfile --port 3000 --yes   # private repo via the GitHub app
+qc app show 7                                 # state, repo, runtime, volume, health, env, domains, builds
+qc app deploy 7                               # build + switch now;  qc app build 7 13  for the log
+qc app env 7 set NODE_ENV=production          # redeploy to apply
+qc app env 7 set STRIPE_KEY=sk_live_… --secret
+qc app db 7 connect 12 --create api           # managed database → DATABASE_URL in the env
+qc app domains 7 add www.example.com          # prints the CNAME / TXT to set, then verify
+qc app domains 7 verify 2
+qc app volume 7 10                            # grow the persistent volume (never shrinks)
+qc app rollback 7 4 --yes                     # back to an earlier image
+qc app stop 7  ·  qc app start 7  ·  qc app delete 7 --yes
+```
+
+Your app must listen on `PORT` (8080 unless you set `--port`). The container disk resets on
+every deploy - anything that must survive goes on the volume.
+
+**Magento Hosting** (stores are created and sized in the panel; the CLI drives the
+staging copy and push-to-live - the day-to-day of a developer):
+
+```sh
+qc shop list                                  # health, size, staging and push state per store
+qc shop staging 3 create --yes                # a copy of live with customer data scrubbed
+qc shop staging 3 password                    # the staging site's HTTP password
+qc shop staging 3 sftp 4 --cidr 203.0.113.0/24   # SFTP onto the copy with your SSH key
+qc shop staging 3 upgrade                     # setup:upgrade + compile + static deploy on staging
+qc shop staging 3 admin                       # staging Magento admin login (shown ONCE per copy)
+qc shop push 3 --yes                          # staging code → live;  qc shop undo 3 --yes  within the undo window
+qc shop staging 3 refresh --yes               # throw the copy away and take a fresh one
+```
 
 **SMTP relay** (QuickSMTP - one sender login per application, DKIM-signed
 sending domains, a searchable delivery log; subscribe and change plans in the panel):
